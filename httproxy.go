@@ -12,11 +12,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"text/template"
 	"time"
 
 	"github.com/fumin/httproxy/config"
+	"github.com/fumin/httproxy/monero"
 	"github.com/pkg/errors"
 	"github.com/tailscale/sqlite"
 )
@@ -44,6 +44,7 @@ type Server struct {
 	C    config.Config
 	Root *os.Root
 	DB   *sql.DB
+	XMR  *monero.Wallet
 
 	ServeMux *http.ServeMux
 	Server   http.Server
@@ -63,11 +64,10 @@ func NewServer(cfg config.Config) (*Server, error) {
 	}
 
 	// Setup database.
-	sqliteURI := filepath.Join(s.C.Root, "sqlite.db")
 	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
 		return sqlite.ExecScript(conn.(sqlite.SQLConn), "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
 	}
-	s.DB = sql.OpenDB(sqlite.Connector(sqliteURI, connInitFunc, nil))
+	s.DB = sql.OpenDB(sqlite.Connector(s.C.DB, connInitFunc, nil))
 	if err := s.DB.Ping(); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
@@ -78,6 +78,11 @@ func NewServer(cfg config.Config) (*Server, error) {
 	err = sqlite.ExecScript(conn, schema)
 	conn.Close()
 	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+
+	s.XMR = monero.NewWallet(s.C.XMR)
+	if _, err := s.XMR.GetBalance(monero.GetBalanceReq{}); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
 
@@ -96,6 +101,8 @@ func NewServer(cfg config.Config) (*Server, error) {
 		s.ServeMux.ServeHTTP(w, r)
 	})
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
+	handleJSON(s, "/Topup", Topup)
+	handleJSON(s, "/Usage", Usage)
 	handleFunc(s, "/{$}", Index)
 
 	return s, nil
@@ -180,4 +187,12 @@ func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 	conn.Close()
 	target.Close()
 	<-errc
+}
+
+func Topup(s *Server, w http.ResponseWriter, r *http.Request) (any, error) {
+	return struct{}{}, nil
+}
+
+func Usage(s *Server, w http.ResponseWriter, r *http.Request) (any, error) {
+	return struct{}{}, nil
 }

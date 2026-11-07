@@ -27,7 +27,7 @@ func mainWithErr() error {
 	case "prod":
 		cfg, err = config.Prod()
 	default:
-		cfg, err = config.Dev()
+		cfg = config.Dev()
 	}
 	if err != nil {
 		return errors.Wrap(err, "")
