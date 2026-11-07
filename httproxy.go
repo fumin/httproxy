@@ -1,6 +1,9 @@
 package httproxy
 
 import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -8,17 +11,39 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"text/template"
 	"time"
 
 	"github.com/fumin/httproxy/config"
+	"github.com/pkg/errors"
+	"github.com/tailscale/sqlite"
 )
+
+const schema = `
+CREATE TABLE IF NOT EXISTS session (
+	id TEXT PRIMARY KEY,
+	usageLimit INTEGER NOT NULL,
+	usage INTEGER NOT NULL,
+	createAt INTEGER NOT NULL
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS payment (
+	method TEXT NOT NULL,
+	tx TEXT NOT NULL,
+	session TEXT NOT NULL,
+	PRIMARY KEY (method, tx)
+) STRICT;
+`
 
 //go:embed static
 var staticFS embed.FS
 
 type Server struct {
-	C config.Config
+	C    config.Config
+	Root *os.Root
+	DB   *sql.DB
 
 	ServeMux *http.ServeMux
 	Server   http.Server
@@ -27,6 +52,36 @@ type Server struct {
 func NewServer(cfg config.Config) (*Server, error) {
 	s := &Server{C: cfg}
 
+	// Setup data folder.
+	if err := os.MkdirAll(cfg.Root, 0700); err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	var err error
+	s.Root, err = os.OpenRoot(s.C.Root)
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+
+	// Setup database.
+	sqliteURI := filepath.Join(s.C.Root, "sqlite.db")
+	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
+		return sqlite.ExecScript(conn.(sqlite.SQLConn), "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+	}
+	s.DB = sql.OpenDB(sqlite.Connector(sqliteURI, connInitFunc, nil))
+	if err := s.DB.Ping(); err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	conn, err := s.DB.Conn(context.Background())
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	err = sqlite.ExecScript(conn, schema)
+	conn.Close()
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+
+	// Setup HTTP server.
 	s.ServeMux = http.NewServeMux()
 	s.Server.Addr = s.C.Addr
 	s.Server.ReadHeaderTimeout = 10 * time.Second
@@ -40,7 +95,6 @@ func NewServer(cfg config.Config) (*Server, error) {
 		}
 		s.ServeMux.ServeHTTP(w, r)
 	})
-
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	handleFunc(s, "/{$}", Index)
 
@@ -48,6 +102,7 @@ func NewServer(cfg config.Config) (*Server, error) {
 }
 
 func (s *Server) Close() error {
+	s.DB.Close()
 	return nil
 }
 

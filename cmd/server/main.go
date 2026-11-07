@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -34,10 +38,25 @@ func mainWithErr() error {
 		return errors.Wrap(err, "")
 	}
 	defer s.Close()
+
+	// Start server.
+	ctrlCCtx, revertSignalHandling := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer revertSignalHandling()
+	go func() {
+		<-ctrlCCtx.Done()
+		revertSignalHandling()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.Server.Shutdown(ctx); err != nil {
+			log.Printf("%+v", err)
+		}
+	}()
 	log.Printf("Listening on %s", s.Server.Addr)
 	if err := s.Server.ListenAndServe(); err != http.ErrServerClosed {
-		log.Printf("%+v", err)
+		return errors.Wrap(err, "")
 	}
+
 	return nil
 }
 

@@ -1,2 +1,4 @@
 github.com/pkg/errors v0.9.1 h1:FEBLx1zS214owpjy7qsBeixbURkuhQAwrK5UwLGTwt4=
 github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINEl0=
+github.com/tailscale/sqlite v0.0.0-20260910121735-acbe2dadf94c h1:oVRKDDAcDxAja8mUjHqrp2IvgwxRiC1W8TeylfMzEqQ=
+github.com/tailscale/sqlite v0.0.0-20260910121735-acbe2dadf94c/go.mod h1:8E+CVT4caNnlQcDsgAukaOVoneywikxZr5NiSv/Wxgo=

@@ -2,4 +2,7 @@ module github.com/fumin/httproxy
 
 go 1.27.3
 
-require github.com/pkg/errors v0.9.1
+require (
+	github.com/pkg/errors v0.9.1
+	github.com/tailscale/sqlite v0.0.0-20260910121735-acbe2dadf94c
+)
