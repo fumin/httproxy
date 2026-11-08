@@ -16,7 +16,7 @@ import (
 
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/config/backendconfig"
-	"github.com/fumin/httproxy/monero"
+	"github.com/fumin/httproxy/util/monero"
 )
 
 func mainWithErr() error {
@@ -81,7 +81,7 @@ func checkBackends() error {
 
 func checkBackendsOnce() error {
 	for _, w := range xmrWallets() {
-		if _, err := monero.NewWallet(w.host).GetBalance(monero.GetBalanceReq{}); err != nil {
+		if _, err := monero.NewWallet(w.host).GetBalance(monero.GetBalanceIn{}); err != nil {
 			return errors.Wrap(err, w.host)
 		}
 	}
@@ -190,7 +190,7 @@ func waitMonerod() error {
 	}
 	start := time.Now()
 	for {
-		_, err := node.GetFeeEstimate(monero.GetFeeEstimateReq{})
+		_, err := node.GetFeeEstimate(monero.GetFeeEstimateIn{})
 		if err == nil {
 			return nil
 		}

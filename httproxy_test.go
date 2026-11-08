@@ -4,52 +4,41 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 
+	"github.com/fumin/httproxy/client"
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/config/backendconfig"
-	"github.com/fumin/httproxy/monero"
+	"github.com/fumin/httproxy/util/monero"
 )
 
-func TestXMR(t *testing.T) {
+func TestTopup(t *testing.T) {
 	b := newBackend(t)
 	defer b.Close()
 
-	// Transfer to server's address.
-	amount := monero.ToPico(0.00001)
-	transferReq := monero.TransferReq{Destinations: []monero.Destination{
-		{
-			Address: b.serverXMRAddr,
-			Amount:  amount,
-		},
-	}}
-	transferResp, err := b.xmr.Transfer(transferReq)
-	if err != nil {
-		t.Errorf("%+v", err)
-	}
-	if transferResp.Amount != amount {
-		t.Errorf("%+v", transferResp)
-	}
-	txid := transferResp.TxHash
+	// Send money.
+	usageLimit := 5 * time.Minute
+	amount := monero.Piconero(usageLimit.Seconds() * client.ProxyPriceXMRPiconeroPerSecond)
+	txid := transfer(b.s.XMR, b.xmr, amount, b.xmrNode)
 
-	// Generate blocks to confirm tx.
-	if _, err := b.xmrNode.Generateblocks(monero.GenerateblocksReq{AmountOfBlocks: 1, WalletAddress: b.xmrAddr}); err != nil {
-		t.Errorf("%+v", err)
+	// Top up.
+	topupIn := client.TopupIn{Method: client.MethodXMR, PaymentTx: txid}
+	topupOut, err := b.c.Topup(topupIn)
+	if err != nil {
+		t.Fatalf("%+v", err)
 	}
 
-	// Refresh and get tx info.
-	if _, err := b.s.XMR.Refresh(monero.RefreshReq{}); err != nil {
-		t.Errorf("%+v", err)
-	}
-	getTxByIdResp, err := b.s.XMR.GetTransferByTxid(monero.GetTransferByTxidReq{Txid: txid})
+	// Check usage limit.
+	usageOut, err := b.c.Usage(client.UsageIn{SessionID: topupOut.ID})
 	if err != nil {
-		t.Errorf("%+v", err)
+		t.Fatalf("%+v", err)
 	}
-	tx := getTxByIdResp.Transfers[0]
-	if !(tx.Type == "in" && tx.Amount == amount) {
-		t.Errorf("%+v", getTxByIdResp)
+	if !(usageOut.UsageLimit == usageLimit) {
+		t.Errorf("%+v", usageOut)
 	}
 }
 
@@ -61,12 +50,14 @@ func TestMain(m *testing.M) {
 }
 
 type backend struct {
-	s             *Server
-	serverXMRAddr string
+	s *Server
 
 	xmrNode *monero.Node
 	xmr     *monero.Wallet
 	xmrAddr string
+
+	hs *httptest.Server
+	c  *client.Client
 }
 
 func newBackend(t *testing.T) *backend {
@@ -85,11 +76,6 @@ func newBackend(t *testing.T) *backend {
 	if err != nil {
 		panic(fmt.Sprintf("%+v", err))
 	}
-	addrResp, err := b.s.XMR.GetAddress(monero.GetAddressReq{})
-	if err != nil {
-		panic(fmt.Sprintf("%+v", err))
-	}
-	b.serverXMRAddr = addrResp.Address
 
 	// Setup monero wallet.
 	b.xmrNode, err = monero.NewNode(backendCfg.Monerod)
@@ -97,7 +83,7 @@ func newBackend(t *testing.T) *backend {
 		panic(fmt.Sprintf("%+v", err))
 	}
 	b.xmr = monero.NewWallet(backendCfg.TestXMR1)
-	addrResp, err = b.xmr.GetAddress(monero.GetAddressReq{})
+	addrResp, err := b.xmr.GetAddress(monero.GetAddressIn{AddressIndex: []int{0}})
 	if err != nil {
 		panic(fmt.Sprintf("%+v", err))
 	}
@@ -106,23 +92,31 @@ func newBackend(t *testing.T) *backend {
 		panic(fmt.Sprintf("%+v", err))
 	}
 
+	// Start server listening on random port.
+	b.hs = httptest.NewServer(b.s.Server.Handler)
+	b.c = client.NewClient(b.hs.Listener.Addr().String())
 	return b
+}
+
+func (b *backend) Close() {
+	b.hs.Close()
+	b.s.Close()
 }
 
 func fundXMRWallet(node *monero.Node, w *monero.Wallet) error {
 	// Make sure wallet has at least minUnlocked funds.
-	minUnlocked := monero.ToPico(1)
+	minUnlocked := monero.Picos(1)
 
 	// Return early if wallet has sufficient balance.
-	addrResp, err := w.GetAddress(monero.GetAddressReq{})
+	addrResp, err := w.GetAddress(monero.GetAddressIn{AddressIndex: []int{0}})
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
 	addr := addrResp.Address
-	if _, err := w.Refresh(monero.RefreshReq{}); err != nil {
+	if _, err := w.Refresh(monero.RefreshIn{}); err != nil {
 		return errors.Wrap(err, "")
 	}
-	balance, err := w.GetBalance(monero.GetBalanceReq{})
+	balance, err := w.GetBalance(monero.GetBalanceIn{})
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
@@ -131,13 +125,13 @@ func fundXMRWallet(node *monero.Node, w *monero.Wallet) error {
 	}
 
 	// Generate blocks to wallet.
-	if _, err := node.Generateblocks(monero.GenerateblocksReq{AmountOfBlocks: 60, WalletAddress: addr}); err != nil {
+	if _, err := node.Generateblocks(monero.GenerateblocksIn{AmountOfBlocks: 60, WalletAddress: addr}); err != nil {
 		return errors.Wrap(err, "")
 	}
-	if _, err := w.Refresh(monero.RefreshReq{}); err != nil {
+	if _, err := w.Refresh(monero.RefreshIn{}); err != nil {
 		return errors.Wrap(err, "")
 	}
-	balance, err = w.GetBalance(monero.GetBalanceReq{})
+	balance, err = w.GetBalance(monero.GetBalanceIn{})
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
@@ -147,6 +141,36 @@ func fundXMRWallet(node *monero.Node, w *monero.Wallet) error {
 	return nil
 }
 
-func (b *backend) Close() {
-	b.s.Close()
+func transfer(dst, src *monero.Wallet, amount monero.Piconero, node *monero.Node) string {
+	// Get addresses.
+	srcAddrOut, err := src.GetAddress(monero.GetAddressIn{})
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	dstAddrOut, err := dst.GetAddress(monero.GetAddressIn{})
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+
+	// Do the transfer.
+	transferIn := monero.TransferIn{Destinations: []monero.Destination{
+		{
+			Address: dstAddrOut.Address,
+			Amount:  amount,
+		},
+	}}
+	transferOut, err := src.Transfer(transferIn)
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+
+	// Refresh wallet.
+	if _, err := node.Generateblocks(monero.GenerateblocksIn{AmountOfBlocks: 1, WalletAddress: srcAddrOut.Address}); err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	if _, err := dst.Refresh(monero.RefreshIn{}); err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+
+	return transferOut.TxHash
 }

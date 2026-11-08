@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"embed"
-	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net"
@@ -15,8 +13,11 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/fumin/httproxy/client"
 	"github.com/fumin/httproxy/config"
-	"github.com/fumin/httproxy/monero"
+	"github.com/fumin/httproxy/util"
+	"github.com/fumin/httproxy/util/jsonrpc"
+	"github.com/fumin/httproxy/util/monero"
 	"github.com/pkg/errors"
 	"github.com/tailscale/sqlite"
 )
@@ -41,10 +42,11 @@ CREATE TABLE IF NOT EXISTS payment (
 var staticFS embed.FS
 
 type Server struct {
-	C    config.Config
-	Root *os.Root
-	DB   *sql.DB
-	XMR  *monero.Wallet
+	C       config.Config
+	Root    *os.Root
+	DB      *sql.DB
+	XMR     *monero.Wallet
+	XMRAddr string
 
 	ServeMux *http.ServeMux
 	Server   http.Server
@@ -82,9 +84,11 @@ func NewServer(cfg config.Config) (*Server, error) {
 	}
 
 	s.XMR = monero.NewWallet(s.C.XMR)
-	if _, err := s.XMR.GetBalance(monero.GetBalanceReq{}); err != nil {
+	addrOut, err := s.XMR.GetAddress(monero.GetAddressIn{AddressIndex: []int{0}})
+	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
+	s.XMRAddr = addrOut.Address
 
 	// Setup HTTP server.
 	s.ServeMux = http.NewServeMux()
@@ -101,8 +105,11 @@ func NewServer(cfg config.Config) (*Server, error) {
 		s.ServeMux.ServeHTTP(w, r)
 	})
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
-	handleJSON(s, "/Topup", Topup)
-	handleJSON(s, "/Usage", Usage)
+	methods := map[string]jsonrpc.MethodParams{
+		"topup": m(s, topup, client.TopupIn{}),
+		"usage": m(s, usage, client.UsageIn{}),
+	}
+	s.ServeMux.HandleFunc("/json_rpc", jsonrpc.NewHandler(methods))
 	handleFunc(s, "/{$}", Index)
 
 	return s, nil
@@ -120,27 +127,9 @@ func handleFunc(s *Server, httpPath string, fn func(*Server, http.ResponseWriter
 	s.ServeMux.HandleFunc(httpPath, handler)
 }
 
-func handleJSON(s *Server, httpPath string, fn func(*Server, http.ResponseWriter, *http.Request) (any, error)) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		res, err := fn(s, w, r)
-		if err != nil {
-			msg := struct {
-				Error struct {
-					Msg string
-				}
-			}{}
-			msg.Error.Msg = fmt.Sprintf("%+v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(msg)
-			return
-		}
-		if err := json.NewEncoder(w).Encode(res); err != nil {
-			log.Printf("%+v", err)
-			return
-		}
-	}
-	s.ServeMux.HandleFunc(httpPath, handler)
+func m[Params, Result any](s *Server, method func(s *Server, params Params) (Result, error), paramsTmpl Params) jsonrpc.MethodParams {
+	m := func(params any) (any, error) { return method(s, params.(Params)) }
+	return jsonrpc.MethodParams{Method: m, Params: paramsTmpl}
 }
 
 //go:embed tmpl/index.html
@@ -189,10 +178,56 @@ func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 	<-errc
 }
 
-func Topup(s *Server, w http.ResponseWriter, r *http.Request) (any, error) {
-	return struct{}{}, nil
+func topup(s *Server, in client.TopupIn) (out Session, err error) {
+	received, err := xmrReceived(s.XMR, s.XMRAddr, in.PaymentTx)
+	if err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	usageLimit := time.Duration(received/client.ProxyPriceXMRPiconeroPerSecond) * time.Second
+
+	newSession := false
+	sessionID := in.SessionID
+	if sessionID == "" {
+		newSession = true
+		sessionID = util.RandStr()
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO payment (method, tx, session) VALUES (?, ?, ?)", in.Method, in.PaymentTx, sessionID); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	if newSession {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO session (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", sessionID, usageLimit.Seconds(), 0, time.Now().Unix()); err != nil {
+			return out, errors.Wrap(err, "")
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, "UPDATE session SET usageLimit=usageLimit+? WHERE id=?", usageLimit.Seconds(), sessionID); err != nil {
+			return out, errors.Wrap(err, "")
+		}
+	}
+	out.ID = sessionID
+	out.ByID(ctx, tx)
+
+	if err := tx.Commit(); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+
+	return
 }
 
-func Usage(s *Server, w http.ResponseWriter, r *http.Request) (any, error) {
-	return struct{}{}, nil
+func usage(s *Server, in client.UsageIn) (out Session, err error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out.ID = in.SessionID
+	if err := out.ByID(ctx, s.DB); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	return
 }
