@@ -1,16 +1,21 @@
 package httproxy
 
 import (
+	"bufio"
+	"encoding/base64"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/pkg/errors"
 
-	"github.com/fumin/httproxy/client"
+	"github.com/fumin/httproxy/api"
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/config/backendconfig"
 	"github.com/fumin/httproxy/util/monero"
@@ -22,22 +27,34 @@ func TestTopup(t *testing.T) {
 
 	// Send money.
 	usageLimit := 5 * time.Minute
-	amount := monero.Piconero(usageLimit.Seconds() * client.ProxyPriceXMRPiconeroPerSecond)
+	amount := monero.Piconero(usageLimit.Seconds() * api.ProxyPriceXMRPiconeroPerSecond)
 	txid := transfer(b.s.XMR, b.xmr, amount, b.xmrNode)
 
 	// Top up.
-	topupIn := client.TopupIn{Method: client.MethodXMR, PaymentTx: txid}
+	topupIn := api.TopupIn{Method: api.MethodXMR, PaymentTx: txid}
 	topupOut, err := b.c.Topup(topupIn)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
 	// Check usage limit.
-	usageOut, err := b.c.Usage(client.UsageIn{SessionID: topupOut.ID})
+	usageOut, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
-	if !(usageOut.UsageLimit == usageLimit) {
+	if !(usageOut.UsageLimit == usageLimit && usageOut.Usage == 0) {
+		t.Errorf("%+v", usageOut)
+	}
+
+	// Use proxy and check usage.
+	if err := useProxy(b.hs.Listener.Addr().String(), topupOut.ID); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	usageOut, err = b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	if usageOut.Usage <= 0 {
 		t.Errorf("%+v", usageOut)
 	}
 }
@@ -57,7 +74,7 @@ type backend struct {
 	xmrAddr string
 
 	hs *httptest.Server
-	c  *client.Client
+	c  *api.Client
 }
 
 func newBackend(t *testing.T) *backend {
@@ -70,6 +87,9 @@ func newBackend(t *testing.T) *backend {
 		Root: t.TempDir(),
 		DB:   fmt.Sprintf("file:/%s?vfs=memdb", t.Name()),
 		XMR:  backendCfg.TestXMR0,
+		Secret: config.Secret{
+			Password: "x",
+		},
 	}
 	var err error
 	b.s, err = NewServer(cfg)
@@ -94,7 +114,7 @@ func newBackend(t *testing.T) *backend {
 
 	// Start server listening on random port.
 	b.hs = httptest.NewServer(b.s.Server.Handler)
-	b.c = client.NewClient(b.hs.Listener.Addr().String())
+	b.c = api.NewClient(b.hs.Listener.Addr().String())
 	return b
 }
 
@@ -173,4 +193,69 @@ func transfer(dst, src *monero.Wallet, amount monero.Piconero, node *monero.Node
 	}
 
 	return transferOut.TxHash
+}
+
+func useProxy(proxyAddr, sessionID string) error {
+	// Start target server.
+	const body = "hello"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, body)
+	}))
+	defer target.Close()
+	targetHost := target.Listener.Addr().String()
+
+	// Connect to proxy.
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return errors.Wrap(err, "")
+	}
+	br := bufio.NewReader(conn)
+
+	// Do a CONNECT request.
+	proxyAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte(sessionID+":"))
+	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\nHost: %s\nProxy-Authorization: %s\n\n", targetHost, targetHost, proxyAuth)
+	if _, err := io.WriteString(conn, connectReq); err != nil {
+		return errors.Wrap(err, "")
+	}
+	connectResp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	if connectResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(connectResp.Body)
+		return errors.Errorf("%d %s", connectResp.StatusCode, b)
+	}
+
+	// Do a request to target through the proxy.
+	req, err := http.NewRequest(http.MethodGet, "http://"+targetHost+"/", nil)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	req.Close = true
+	if err := req.Write(conn); err != nil {
+		return errors.Wrap(err, "")
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	if string(b) != body {
+		return errors.Errorf("%d %s", resp.StatusCode, b)
+	}
+
+	// Wait till the proxy http.Handler has returned with all defer functions finished running.
+	// This is achieved by waiting for the connection to be closed, since this only happens when a http.Handler has returned.
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return errors.Wrap(err, "")
+	}
+	return nil
 }

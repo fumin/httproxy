@@ -1,13 +1,10 @@
-package client
+package api
 
 import (
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"net/http"
 	"time"
 
 	"github.com/fumin/httproxy/util/jsonrpc"
-	"github.com/pkg/errors"
 )
 
 const (
@@ -39,21 +36,6 @@ type Session struct {
 	ID         string
 	UsageLimit time.Duration
 	Usage      time.Duration
-}
-
-func (s *Session) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	var sj struct {
-		ID         string
-		UsageLimit int64
-		Usage      int64
-	}
-	if err := json.UnmarshalDecode(dec, &sj); err != nil {
-		return errors.Wrap(err, "")
-	}
-	s.ID = sj.ID
-	s.UsageLimit = time.Duration(sj.UsageLimit) * time.Second
-	s.Usage = time.Duration(sj.Usage) * time.Second
-	return nil
 }
 
 func (c *Client) Topup(in TopupIn) (out Session, err error) {

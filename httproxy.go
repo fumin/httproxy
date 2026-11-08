@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"embed"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -13,7 +14,7 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/fumin/httproxy/client"
+	"github.com/fumin/httproxy/api"
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/util"
 	"github.com/fumin/httproxy/util/jsonrpc"
@@ -106,8 +107,8 @@ func NewServer(cfg config.Config) (*Server, error) {
 	})
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	methods := map[string]jsonrpc.MethodParams{
-		"topup": m(s, topup, client.TopupIn{}),
-		"usage": m(s, usage, client.UsageIn{}),
+		"topup": m(s, topup, api.TopupIn{}),
+		"usage": m(s, usage, api.UsageIn{}),
 	}
 	s.ServeMux.HandleFunc("/json_rpc", jsonrpc.NewHandler(methods))
 	handleFunc(s, "/{$}", Index)
@@ -145,6 +146,38 @@ func Index(s *Server, w http.ResponseWriter, r *http.Request) {
 }
 
 func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
+	startTime := time.Now()
+	// Check usage limits.
+	ar := &http.Request{Header: http.Header{"Authorization": r.Header.Values("Proxy-Authorization")}}
+	sessionID, _, _ := ar.BasicAuth()
+	if sessionID == "" {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="httproxy"`)
+		http.Error(w, "proxy authentication required, please provide the session ID as the username", http.StatusProxyAuthRequired)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var ss Session
+	if err := s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage); err != nil {
+		http.Error(w, "payment required", http.StatusPaymentRequired)
+		return
+	}
+	if ss.Usage > ss.UsageLimit {
+		http.Error(w, fmt.Sprintf("payment required, usage %d exceeds limit %d nanoseconds, please top up", ss.Usage, ss.UsageLimit), http.StatusPaymentRequired)
+		return
+	}
+	// Update usage.
+	defer func() {
+		usage := time.Now().Sub(startTime)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := s.DB.ExecContext(ctx, "UPDATE session SET usage=usage+? WHERE id=?", usage, sessionID); err != nil {
+			log.Printf("update usage error for session %s usage %d: %s", sessionID, usage, err)
+		}
+	}()
+
+	// Begin proxy by taking over connection.
 	conn, client, err := http.NewResponseController(w).Hijack()
 	if err != nil {
 		http.Error(w, "hijacking not supported", http.StatusBadRequest)
@@ -178,12 +211,12 @@ func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 	<-errc
 }
 
-func topup(s *Server, in client.TopupIn) (out Session, err error) {
+func topup(s *Server, in api.TopupIn) (out Session, err error) {
 	received, err := xmrReceived(s.XMR, s.XMRAddr, in.PaymentTx)
 	if err != nil {
 		return out, errors.Wrap(err, "")
 	}
-	usageLimit := time.Duration(received/client.ProxyPriceXMRPiconeroPerSecond) * time.Second
+	usageLimit := time.Duration(received/api.ProxyPriceXMRPiconeroPerSecond) * time.Second
 
 	newSession := false
 	sessionID := in.SessionID
@@ -204,16 +237,17 @@ func topup(s *Server, in client.TopupIn) (out Session, err error) {
 		return out, errors.Wrap(err, "")
 	}
 	if newSession {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO session (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", sessionID, usageLimit.Seconds(), 0, time.Now().Unix()); err != nil {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO session (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", sessionID, usageLimit, 0, time.Now().Unix()); err != nil {
 			return out, errors.Wrap(err, "")
 		}
 	} else {
-		if _, err := tx.ExecContext(ctx, "UPDATE session SET usageLimit=usageLimit+? WHERE id=?", usageLimit.Seconds(), sessionID); err != nil {
+		if _, err := tx.ExecContext(ctx, "UPDATE session SET usageLimit=usageLimit+? WHERE id=?", usageLimit, sessionID); err != nil {
 			return out, errors.Wrap(err, "")
 		}
 	}
-	out.ID = sessionID
-	out.ByID(ctx, tx)
+	if err := tx.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
+		return out, errors.Wrap(err, "")
+	}
 
 	if err := tx.Commit(); err != nil {
 		return out, errors.Wrap(err, "")
@@ -222,11 +256,10 @@ func topup(s *Server, in client.TopupIn) (out Session, err error) {
 	return
 }
 
-func usage(s *Server, in client.UsageIn) (out Session, err error) {
+func usage(s *Server, in api.UsageIn) (out Session, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out.ID = in.SessionID
-	if err := out.ByID(ctx, s.DB); err != nil {
+	if err := s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", in.SessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
 		return out, errors.Wrap(err, "")
 	}
 	return

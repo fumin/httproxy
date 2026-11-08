@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"bytes"
 	"context"
+	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/pkg/errors"
 )
+
+var jsonOpts = jsonv1.FormatDurationAsNano(true)
 
 type RPCError struct {
 	Code    int    `json:"code"`
@@ -34,7 +37,7 @@ func Do(client *http.Client, url, method string, params, result any) error {
 		ID: "0", JSONRPC: "2.0", Method: method, Params: params,
 	}
 	reqBody := new(bytes.Buffer)
-	if err := json.MarshalWrite(reqBody, reqJ); err != nil {
+	if err := json.MarshalWrite(reqBody, reqJ, jsonOpts); err != nil {
 		return errors.Wrap(err, "")
 	}
 
@@ -54,7 +57,7 @@ func Do(client *http.Client, url, method string, params, result any) error {
 
 	// Parse response.
 	respJ := response{Result: result}
-	if err := json.UnmarshalRead(resp.Body, &respJ); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &respJ, jsonOpts); err != nil {
 		return errors.Wrap(err, "")
 	}
 	if respJ.Error != nil {
@@ -74,10 +77,10 @@ func NewHandler(methods map[string]MethodParams) func(w http.ResponseWriter, r *
 		w.Header().Set("Content-Type", "application/json")
 		result, err := handle(methods, r.Body)
 		if err != nil {
-			json.MarshalWrite(w, response{Error: err})
+			json.MarshalWrite(w, response{Error: err}, jsonOpts)
 			return
 		}
-		json.MarshalWrite(w, response{Result: result})
+		json.MarshalWrite(w, response{Result: result}, jsonOpts)
 	}
 }
 
@@ -92,7 +95,7 @@ func handle(methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
 		Method string         `json:"method"`
 		Params jsontext.Value `json:"params"`
 	}{}
-	if err := json.UnmarshalRead(body, &req); err != nil {
+	if err := json.UnmarshalRead(body, &req, jsonOpts); err != nil {
 		return nil, &RPCError{Code: -32600, Message: err.Error()}
 	}
 	m, ok := methods[req.Method]
@@ -103,7 +106,7 @@ func handle(methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
 	// Parse params.
 	paramsPtr := reflect.New(reflect.TypeOf(m.Params))
 	if len(req.Params) > 0 {
-		if err := json.Unmarshal(req.Params, paramsPtr.Interface()); err != nil {
+		if err := json.Unmarshal(req.Params, paramsPtr.Interface(), jsonOpts); err != nil {
 			return nil, &RPCError{Code: -32602, Message: err.Error()}
 		}
 	}

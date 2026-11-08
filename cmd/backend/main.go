@@ -123,7 +123,7 @@ type xmrWallet struct {
 }
 
 func (w xmrWallet) dir() string {
-	return filepath.Join(config.Dev().Root, "monero_wallet", w.name)
+	return filepath.Join(config.DevRoot, "monero_wallet", w.name)
 }
 
 func (w xmrWallet) file() string {
