@@ -26,7 +26,7 @@ func (e RPCError) Error() string {
 	return e.Message
 }
 
-func Do(client *http.Client, url, method string, params, result any) error {
+func Do(url, method string, params, result any, header http.Header) error {
 	// Prepare request body.
 	reqJ := struct {
 		ID      string `json:"id"`
@@ -48,12 +48,21 @@ func Do(client *http.Client, url, method string, params, result any) error {
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return errors.Errorf("%d %s", resp.StatusCode, body)
+	}
 
 	// Parse response.
 	respJ := response{Result: result}
@@ -72,8 +81,18 @@ type MethodParams struct {
 	Params any
 }
 
-func NewHandler(methods map[string]MethodParams) func(w http.ResponseWriter, r *http.Request) {
+type Authorizer interface {
+	Check(w http.ResponseWriter, r *http.Request) bool
+}
+
+func NewHandler(methods map[string]MethodParams, auth Authorizer) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if auth != nil {
+			if ok := auth.Check(w, r); !ok {
+				return
+			}
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		result, err := handle(methods, r.Body)
 		if err != nil {

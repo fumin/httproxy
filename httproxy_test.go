@@ -23,7 +23,7 @@ import (
 
 func TestTopup(t *testing.T) {
 	b := newBackend(t)
-	defer b.Close()
+	t.Cleanup(b.Close)
 
 	// Send money.
 	usageLimit := 5 * time.Minute

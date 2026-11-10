@@ -1,0 +1,14 @@
+{{define "navbar"}}
+<div style="display: flex; justify-content: space-between; align-items: center;">
+	<div style="display: flex; align-items: center;">
+		<div><a href="{{.PathIndex}}"><h1>Admin</h1></a></div>
+	</div>
+	<div style="">
+		{{if .LoggedIn}}
+		<a href="{{.PathLogout}}">logout</a>
+		{{else}}
+		<a href="{{.PathLogin}}">login</a>
+		{{end}}
+	</div>
+</div>
+{{end}}

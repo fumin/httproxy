@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+  </style>
+</head>
+<body>
+{{template "navbar" .Common.Navbar}}
+
+<div id="new-voucher">
+	<button>new voucher</button>
+	<pre></pre>
+</div>
+
+{{range $_, $s := .Vouchers}}
+	<div>ID: {{$s.ID}}, UsageLimit: {{$s.UsageLimit}}, Usage: {{$s.Usage}}, CreateAt: {{$s.CreateAt}}</div>
+{{end}}
+
+<script type="importmap">
+{"imports": {
+	"util": "/static/util.js"
+}}
+</script>
+<script type="module">
+import * as util from "util";
+
+let page = {{.}};
+
+function addRPC(selector, method, params) {
+	let container = document.querySelector(selector);
+	let btn = container.querySelector("button");
+	let out = container.querySelector("pre");
+	btn.addEventListener("click", async function(){
+		btn.disabled = true;
+		out.textContent = "...";
+		try {
+			let result = await util.rpc(page.PathRPC, method, params);
+			out.textContent = JSON.stringify(result, null, 2);
+		} catch (err) {
+			out.textContent = "Error: " + err.message;
+		} finally {
+			btn.disabled = false;
+		}
+	});
+}
+
+addRPC("#new-voucher", "deal_voucher");
+</script>
+</body>
+</html>

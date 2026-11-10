@@ -1,8 +1,6 @@
 package monero
 
 import (
-	"net/http"
-
 	"github.com/fumin/httproxy/util/jsonrpc"
 )
 
@@ -17,12 +15,11 @@ func Picos(amount float64) Piconero {
 }
 
 type Wallet struct {
-	url    string
-	client *http.Client
+	url string
 }
 
 func NewWallet(host string) *Wallet {
-	return &Wallet{url: "http://" + host + "/json_rpc", client: &http.Client{}}
+	return &Wallet{url: "http://" + host + "/json_rpc"}
 }
 
 type GetBalanceIn struct {
@@ -48,7 +45,7 @@ type GetBalanceOut struct {
 }
 
 func (c *Wallet) GetBalance(in GetBalanceIn) (out GetBalanceOut, err error) {
-	err = jsonrpc.Do(c.client, c.url, "get_balance", in, &out)
+	err = jsonrpc.Do(c.url, "get_balance", in, &out, nil)
 	return
 }
 
@@ -68,7 +65,7 @@ type GetAddressOut struct {
 }
 
 func (c *Wallet) GetAddress(in GetAddressIn) (out GetAddressOut, err error) {
-	err = jsonrpc.Do(c.client, c.url, "get_address", in, &out)
+	err = jsonrpc.Do(c.url, "get_address", in, &out, nil)
 	return
 }
 
@@ -91,7 +88,7 @@ type TransferOut struct {
 }
 
 func (c *Wallet) Transfer(in TransferIn) (out TransferOut, err error) {
-	err = jsonrpc.Do(c.client, c.url, "transfer", in, &out)
+	err = jsonrpc.Do(c.url, "transfer", in, &out, nil)
 	return
 }
 
@@ -105,7 +102,7 @@ type RefreshOut struct {
 }
 
 func (c *Wallet) Refresh(in RefreshIn) (out RefreshOut, err error) {
-	err = jsonrpc.Do(c.client, c.url, "refresh", in, &out)
+	err = jsonrpc.Do(c.url, "refresh", in, &out, nil)
 	return
 }
 
@@ -142,6 +139,6 @@ type GetTransferByTxidOut struct {
 }
 
 func (c *Wallet) GetTransferByTxid(in GetTransferByTxidIn) (out GetTransferByTxidOut, err error) {
-	err = jsonrpc.Do(c.client, c.url, "get_transfer_by_txid", in, &out)
+	err = jsonrpc.Do(c.url, "get_transfer_by_txid", in, &out, nil)
 	return
 }

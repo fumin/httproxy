@@ -1,18 +1,15 @@
 package monero
 
 import (
-	"net/http"
-
 	"github.com/fumin/httproxy/util/jsonrpc"
 )
 
 type Node struct {
-	url    string
-	client *http.Client
+	url string
 }
 
 func NewNode(host string) (*Node, error) {
-	n := &Node{url: "http://" + host + "/json_rpc", client: &http.Client{}}
+	n := &Node{url: "http://" + host + "/json_rpc"}
 	return n, nil
 }
 
@@ -29,7 +26,7 @@ type GenerateblocksOut struct {
 }
 
 func (n *Node) Generateblocks(in GenerateblocksIn) (out GenerateblocksOut, err error) {
-	err = jsonrpc.Do(n.client, n.url, "generateblocks", in, &out)
+	err = jsonrpc.Do(n.url, "generateblocks", in, &out, nil)
 	return
 }
 
@@ -46,6 +43,6 @@ type GetFeeEstimateOut struct {
 }
 
 func (n *Node) GetFeeEstimate(in GetFeeEstimateIn) (out GetFeeEstimateOut, err error) {
-	err = jsonrpc.Do(n.client, n.url, "get_fee_estimate", in, &out)
+	err = jsonrpc.Do(n.url, "get_fee_estimate", in, &out, nil)
 	return
 }

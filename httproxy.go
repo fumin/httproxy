@@ -11,10 +11,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"text/template"
 	"time"
 
 	"github.com/fumin/httproxy/api"
+	"github.com/fumin/httproxy/auth"
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/util"
 	"github.com/fumin/httproxy/util/jsonrpc"
@@ -49,6 +51,9 @@ type Server struct {
 	XMR     *monero.Wallet
 	XMRAddr string
 
+	auth     *auth.Authorizer
+	vouchers *voucherDealer
+
 	ServeMux *http.ServeMux
 	Server   http.Server
 }
@@ -65,7 +70,6 @@ func NewServer(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
-
 	// Setup database.
 	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
 		return sqlite.ExecScript(conn.(sqlite.SQLConn), "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
@@ -83,14 +87,16 @@ func NewServer(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
-
+	// XMR wallet.
 	s.XMR = monero.NewWallet(s.C.XMR)
 	addrOut, err := s.XMR.GetAddress(monero.GetAddressIn{AddressIndex: []int{0}})
 	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
 	s.XMRAddr = addrOut.Address
-
+	// Miscellaneous.
+	s.auth = auth.NewAuthorizer()
+	s.vouchers = newVoucherDealer()
 	// Setup HTTP server.
 	s.ServeMux = http.NewServeMux()
 	s.Server.Addr = s.C.Addr
@@ -105,18 +111,20 @@ func NewServer(cfg config.Config) (*Server, error) {
 		}
 		s.ServeMux.ServeHTTP(w, r)
 	})
+	handleAdmin(s)
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	methods := map[string]jsonrpc.MethodParams{
 		"topup": m(s, topup, api.TopupIn{}),
 		"usage": m(s, usage, api.UsageIn{}),
 	}
-	s.ServeMux.HandleFunc("/json_rpc", jsonrpc.NewHandler(methods))
+	s.ServeMux.HandleFunc("/json_rpc", jsonrpc.NewHandler(methods, nil))
 	handleFunc(s, "/{$}", Index)
 
 	return s, nil
 }
 
 func (s *Server) Close() error {
+	s.vouchers.Close()
 	s.DB.Close()
 	return nil
 }
@@ -147,7 +155,7 @@ func Index(s *Server, w http.ResponseWriter, r *http.Request) {
 
 func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	// Check usage limits.
+	// Get session ID.
 	ar := &http.Request{Header: http.Header{"Authorization": r.Header.Values("Proxy-Authorization")}}
 	sessionID, _, _ := ar.BasicAuth()
 	if sessionID == "" {
@@ -155,24 +163,40 @@ func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy authentication required, please provide the session ID as the username", http.StatusProxyAuthRequired)
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	// Check usage limits.
 	var ss Session
-	if err := s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage); err != nil {
-		http.Error(w, "payment required", http.StatusPaymentRequired)
+	var err error
+	if strings.HasPrefix(sessionID, voucherPrefix) {
+		ss, err = s.vouchers.get(sessionID)
+	} else {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err = s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage)
+	}
+	if err != nil {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="httproxy"`)
+		http.Error(w, "payment required", http.StatusProxyAuthRequired)
 		return
 	}
 	if ss.Usage > ss.UsageLimit {
-		http.Error(w, fmt.Sprintf("payment required, usage %d exceeds limit %d nanoseconds, please top up", ss.Usage, ss.UsageLimit), http.StatusPaymentRequired)
+		w.Header().Set("Proxy-Authenticate", `Basic realm="httproxy"`)
+		http.Error(w, fmt.Sprintf("payment required, usage %d exceeds limit %d nanoseconds, please top up", ss.Usage, ss.UsageLimit), http.StatusProxyAuthRequired)
 		return
 	}
 	// Update usage.
 	defer func() {
 		usage := time.Now().Sub(startTime)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if _, err := s.DB.ExecContext(ctx, "UPDATE session SET usage=usage+? WHERE id=?", usage, sessionID); err != nil {
+		var err error
+		if strings.HasPrefix(sessionID, voucherPrefix) {
+			s.vouchers.use(sessionID, usage)
+		} else {
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			_, err = s.DB.ExecContext(ctx, "UPDATE session SET usage=usage+? WHERE id=?", usage, sessionID)
+		}
+		if err != nil {
 			log.Printf("update usage error for session %s usage %d: %s", sessionID, usage, err)
 		}
 	}()

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"net/http"
 	"time"
 
 	"github.com/fumin/httproxy/util/jsonrpc"
@@ -12,12 +11,11 @@ const (
 )
 
 type Client struct {
-	url    string
-	client *http.Client
+	url string
 }
 
 func NewClient(host string) *Client {
-	return &Client{url: "http://" + host + "/json_rpc", client: &http.Client{}}
+	return &Client{url: "http://" + host + "/json_rpc"}
 }
 
 type PaymentMethod string
@@ -39,7 +37,7 @@ type Session struct {
 }
 
 func (c *Client) Topup(in TopupIn) (out Session, err error) {
-	err = jsonrpc.Do(c.client, c.url, "topup", in, &out)
+	err = jsonrpc.Do(c.url, "topup", in, &out, nil)
 	return
 }
 
@@ -48,6 +46,6 @@ type UsageIn struct {
 }
 
 func (c *Client) Usage(in UsageIn) (out Session, err error) {
-	err = jsonrpc.Do(c.client, c.url, "usage", in, &out)
+	err = jsonrpc.Do(c.url, "usage", in, &out, nil)
 	return
 }
