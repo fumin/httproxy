@@ -1,13 +1,11 @@
 package api
 
 import (
-	"time"
-
 	"github.com/fumin/httproxy/util/jsonrpc"
 )
 
 const (
-	ProxyPriceXMRPiconeroPerSecond = 5347 // 3e-6 USD/second
+	ProxyPriceXMRPicoPerByte = 20
 )
 
 type Client struct {
@@ -32,8 +30,8 @@ type TopupIn struct {
 
 type Session struct {
 	ID         string
-	UsageLimit time.Duration
-	Usage      time.Duration
+	UsageLimit int64
+	Usage      int64
 }
 
 func (c *Client) Topup(in TopupIn) (out Session, err error) {

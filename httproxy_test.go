@@ -26,8 +26,8 @@ func TestTopup(t *testing.T) {
 	t.Cleanup(b.Close)
 
 	// Send money.
-	usageLimit := 5 * time.Minute
-	amount := monero.Piconero(usageLimit.Seconds() * api.ProxyPriceXMRPiconeroPerSecond)
+	const usageLimit = 1e9
+	amount := monero.Piconero(usageLimit * api.ProxyPriceXMRPicoPerByte)
 	txid := transfer(b.s.XMR, b.xmr, amount, b.xmrNode)
 
 	// Top up.

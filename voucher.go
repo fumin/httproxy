@@ -41,7 +41,7 @@ func (v *voucherDealer) Close() {
 
 func (v *voucherDealer) deal() Session {
 	id := voucherPrefix + util.RandStr()
-	s := Session{ID: id, UsageLimit: 5 * time.Minute, CreateAt: time.Now()}
+	s := Session{ID: id, UsageLimit: 1e9, CreateAt: time.Now()}
 
 	v.Lock()
 	v.vouchers[s.ID] = s
@@ -50,7 +50,7 @@ func (v *voucherDealer) deal() Session {
 	return s
 }
 
-func (v *voucherDealer) use(id string, usage time.Duration) {
+func (v *voucherDealer) use(id string, usage int64) {
 	v.Lock()
 	defer v.Unlock()
 

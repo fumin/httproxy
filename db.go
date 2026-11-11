@@ -14,7 +14,7 @@ type DB interface {
 
 type Session struct {
 	ID         string
-	UsageLimit time.Duration
-	Usage      time.Duration
+	UsageLimit int64
+	Usage      int64
 	CreateAt   time.Time `json:",omitzero"`
 }

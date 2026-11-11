@@ -47,9 +47,10 @@ func mainWithErr() error {
 	case <-signalCtx.Done():
 		unregisterSignal()
 		stopAll(cmds)
-	case <-exits:
+	case ex := <-exits:
 		numExited++
 		stopAll(cmds)
+		return errors.Errorf("%s exited prematurely: %v", strings.Join(ex.cmd.Args, " "), ex.err)
 	}
 
 	return nil
