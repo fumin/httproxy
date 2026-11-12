@@ -38,24 +38,36 @@ func TestTopup(t *testing.T) {
 	}
 
 	// Check usage limit.
-	usageOut, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	usageOut0, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
-	if !(usageOut.UsageLimit == usageLimit && usageOut.Usage == 0) {
-		t.Errorf("%+v", usageOut)
+	if !(usageOut0.UsageLimit == usageLimit && usageOut0.Usage == 0) {
+		t.Errorf("%+v", usageOut0)
 	}
 
 	// Use proxy and check usage.
 	if err := useProxy(b.hs.Listener.Addr().String(), topupOut.ID); err != nil {
 		t.Fatalf("%+v", err)
 	}
-	usageOut, err = b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	usageOut1, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
-	if usageOut.Usage <= 0 {
-		t.Errorf("%+v", usageOut)
+	if usageOut1.Usage <= usageOut0.Usage {
+		t.Errorf("%+v %+v", usageOut1, usageOut0)
+	}
+
+	// Use proxy for plain HTTP and check usage.
+	if err := useHTTPProxy(b.hs.Listener.Addr().String(), topupOut.ID); err != nil {
+		t.Fatalf("%+v", err)
+	}
+	usageOut2, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	if usageOut2.Usage <= usageOut1.Usage {
+		t.Errorf("%+v %+v", usageOut2, usageOut1)
 	}
 }
 
@@ -252,8 +264,58 @@ func useProxy(proxyAddr, sessionID string) error {
 		return errors.Errorf("%d %s", resp.StatusCode, b)
 	}
 
-	// Wait till the proxy http.Handler has returned with all defer functions finished running.
+	// Wait till the proxy http.Handler has returned, so that we can be sure usage has been recorded.
 	// This is achieved by waiting for the connection to be closed, since this only happens when a http.Handler has returned.
+	if _, err := io.Copy(io.Discard, br); err != nil {
+		return errors.Wrap(err, "")
+	}
+	return nil
+}
+
+func useHTTPProxy(proxyAddr, sessionID string) error {
+	// Start target server, which must not see the proxy credentials.
+	const body = "hello"
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if v := r.Header.Get("Proxy-Authorization"); v != "" {
+			panic("credentials leaked")
+		}
+		io.WriteString(w, body)
+	}))
+	defer target.Close()
+
+	// Send an absolute-form request to the proxy.
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		return errors.Wrap(err, "")
+	}
+	br := bufio.NewReader(conn)
+	req, err := http.NewRequest(http.MethodGet, target.URL+"/", nil)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	req.Close = true
+	req.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(sessionID+":")))
+	if err := req.WriteProxy(conn); err != nil {
+		return errors.Wrap(err, "")
+	}
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+	if resp.StatusCode != http.StatusOK || string(b) != body {
+		return errors.Errorf("%d %s", resp.StatusCode, b)
+	}
+
+	// Wait till the proxy http.Handler has returned, so that we can be sure usage has been recorded.
 	if _, err := io.Copy(io.Discard, br); err != nil {
 		return errors.Wrap(err, "")
 	}

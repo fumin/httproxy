@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	ProxyPriceXMRPicoPerByte = 20
+	ProxyPriceXMRPicoPerByte = 10
 )
 
 type Client struct {

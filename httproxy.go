@@ -5,13 +5,9 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"embed"
-	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
-	"strings"
 	"text/template"
 	"time"
 
@@ -105,11 +101,14 @@ func NewServer(cfg config.Config) (*Server, error) {
 	s.Server.WriteTimeout = 30 * time.Second
 	s.Server.IdleTimeout = 30 * time.Second
 	s.Server.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodConnect {
+		switch {
+		case r.Method == http.MethodConnect:
 			Proxy(s, w, r)
-			return
+		case r.URL.IsAbs():
+			ProxyHTTP(s, w, r)
+		default:
+			s.ServeMux.ServeHTTP(w, r)
 		}
-		s.ServeMux.ServeHTTP(w, r)
 	})
 	handleAdmin(s)
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
@@ -151,93 +150,6 @@ func Index(s *Server, w http.ResponseWriter, r *http.Request) {
 	if err := indexTmpl.Execute(w, page); err != nil {
 		log.Printf("%+v", err)
 	}
-}
-
-func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
-	// Get session ID.
-	ar := &http.Request{Header: http.Header{"Authorization": r.Header.Values("Proxy-Authorization")}}
-	sessionID, _, _ := ar.BasicAuth()
-	if sessionID == "" {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="please_enter_your_sessionID_as_username_and_leave_password_blank"`)
-		http.Error(w, "proxy authentication required, please provide the session ID as the username", http.StatusProxyAuthRequired)
-		return
-	}
-	// Check usage limits.
-	var ss Session
-	var err error
-	if strings.HasPrefix(sessionID, voucherPrefix) {
-		ss, err = s.vouchers.get(sessionID)
-	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		err = s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage)
-	}
-	if err != nil {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="payment_required"`)
-		http.Error(w, "payment required", http.StatusProxyAuthRequired)
-		return
-	}
-	if ss.Usage > ss.UsageLimit {
-		w.Header().Set("Proxy-Authenticate", `Basic realm="payment_required_usage_exceeds_limit_please_top_up"`)
-		http.Error(w, fmt.Sprintf("payment required, usage %d exceeds limit %d bytes, please top up", ss.Usage, ss.UsageLimit), http.StatusProxyAuthRequired)
-		return
-	}
-	// Update usage.
-	var usage int64
-	defer func() {
-		var err error
-		if strings.HasPrefix(sessionID, voucherPrefix) {
-			s.vouchers.use(sessionID, usage)
-		} else {
-
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_, err = s.DB.ExecContext(ctx, "UPDATE session SET usage=usage+? WHERE id=?", usage, sessionID)
-		}
-		if err != nil {
-			log.Printf("update usage error for session %s usage %d: %s", sessionID, usage, err)
-		}
-	}()
-
-	target, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(r.Context(), "tcp", r.Host)
-	if err != nil {
-		http.Error(w, "cannot reach "+r.Host, http.StatusBadGateway)
-		return
-	}
-	defer target.Close()
-
-	// Begin proxy by taking over connection.
-	conn, client, err := http.NewResponseController(w).Hijack()
-	if err != nil {
-		http.Error(w, "hijacking not supported", http.StatusBadRequest)
-		return
-	}
-	defer conn.Close()
-	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return
-	}
-
-	if _, err := client.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		return
-	}
-	if err := client.Flush(); err != nil {
-		return
-	}
-
-	type copyOut struct {
-		n   int64
-		err error
-	}
-	c := make(chan copyOut)
-	go func() { n, err := io.Copy(target, client); c <- copyOut{n: n, err: err} }()
-	go func() { n, err := io.Copy(client, target); c <- copyOut{n: n, err: err} }()
-	co0 := <-c
-	conn.Close()
-	target.Close()
-	co1 := <-c
-
-	usage += co0.n
-	usage += co1.n
 }
 
 func topup(s *Server, in api.TopupIn) (out Session, err error) {
