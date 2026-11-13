@@ -5,7 +5,7 @@
 Make sure `monero-wallet-rpc` is running:
 
 ```
-curl --silent http://127.0.0.1:28088/json_rpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"0","method":"get_version"}'
+curl --silent http://127.0.0.1:28088/json_rpc -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":"0","method":"get_address"}'
 ```
 
 then run:

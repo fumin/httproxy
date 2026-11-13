@@ -6,4 +6,5 @@ require (
 	github.com/btcsuite/btcd/address/v2 v2.0.1
 	github.com/pkg/errors v0.9.1
 	github.com/tailscale/sqlite v0.0.0-20260910121735-acbe2dadf94c
+	github.com/yuin/goldmark v1.8.7
 )

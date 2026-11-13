@@ -6,7 +6,6 @@ import (
 	jsonv1 "encoding/json"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
-	"fmt"
 	"io"
 	"net/http"
 	"reflect"
@@ -134,8 +133,7 @@ func handle(methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
 	// Invoke method.
 	result, err := m.Method(params)
 	if err != nil {
-		msg := fmt.Sprintf("%+v", err)
-		return nil, &RPCError{Code: -1, Message: msg}
+		return nil, &RPCError{Code: -1, Message: err.Error()}
 	}
 	return result, nil
 }

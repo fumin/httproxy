@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>HTTP Proxy</title>
+	<style>
+img { max-width: 100%; }
+.code-block { position: relative; }
+.code-block pre { overflow-x: auto; padding-right: 4.5em; }
+.copy-button { position: absolute; top: 0.3em; right: 0.3em; }
+	</style>
+</head>
+<body>
+{{.Body}}
+<script>
+// Text to copy from a code block: everything before the "# Output:" comment, if any.
+function commandText(code) {
+	let lines = code.innerText.split("\n");
+	let end = lines.findIndex(l => /^#\s*Output/.test(l));
+	if (end >= 0) {
+		lines = lines.slice(0, end);
+	}
+	return lines.join("\n").trim();
+}
+
+async function copyText(text) {
+	if (navigator.clipboard && window.isSecureContext) {
+		await navigator.clipboard.writeText(text);
+		return;
+	}
+	// Fallback for non-HTTPS pages, where the Clipboard API is unavailable.
+	let ta = document.createElement("textarea");
+	ta.value = text;
+	ta.style.position = "fixed";
+	ta.style.opacity = "0";
+	document.body.appendChild(ta);
+	ta.select();
+	let ok = document.execCommand("copy");
+	ta.remove();
+	if (!ok) {
+		throw new Error("copy failed");
+	}
+}
+
+for (let pre of document.querySelectorAll("pre")) {
+	let code = pre.querySelector("code") || pre;
+	let wrapper = document.createElement("div");
+	wrapper.className = "code-block";
+	pre.replaceWith(wrapper);
+	wrapper.appendChild(pre);
+
+	let button = document.createElement("button");
+	button.type = "button";
+	button.className = "copy-button";
+	button.textContent = "Copy";
+	button.addEventListener("click", async () => {
+		try {
+			await copyText(commandText(code));
+			button.textContent = "Copied!";
+		} catch (e) {
+			button.textContent = "Failed";
+		}
+		setTimeout(() => { button.textContent = "Copy"; }, 1500);
+	});
+	wrapper.appendChild(button);
+}
+</script>
+</body>
+</html>

@@ -16,12 +16,14 @@ type Secret struct {
 }
 
 type Config struct {
+	Secret Secret
+
 	Addr string
 	Root string
 	DB   string
 	XMR  string
 
-	Secret Secret
+	DetailError bool
 }
 
 func Prod() (Config, error) {
@@ -36,10 +38,10 @@ func Prod() (Config, error) {
 		return Config{}, errors.Wrap(err, "")
 	}
 	cfg := Config{
+		Secret: secret,
 		Addr:   ":28877",
 		Root:   filepath.Join(projDir, "data"),
 		XMR:    "127.0.0.1:28088",
-		Secret: secret,
 	}
 	cfg.DB = filepath.Join(cfg.Root, "sqlite.db")
 	return cfg, nil
@@ -51,10 +53,11 @@ func Dev() (Config, error) {
 		return Config{}, errors.Wrap(err, "")
 	}
 	cfg := Config{
-		Addr:   ":28877",
-		Root:   DevRoot,
-		XMR:    "127.0.0.1:28088",
-		Secret: secret,
+		Secret:      secret,
+		Addr:        ":28877",
+		Root:        DevRoot,
+		XMR:         "127.0.0.1:28088",
+		DetailError: true,
 	}
 	cfg.DB = filepath.Join(cfg.Root, "sqlite.db")
 	return cfg, nil

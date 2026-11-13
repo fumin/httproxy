@@ -1,14 +1,15 @@
 package httproxy
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"embed"
-	"log"
+	"fmt"
+	"html/template"
 	"net/http"
 	"os"
-	"text/template"
 	"time"
 
 	"github.com/fumin/httproxy/api"
@@ -19,6 +20,9 @@ import (
 	"github.com/fumin/httproxy/util/monero"
 	"github.com/pkg/errors"
 	"github.com/tailscale/sqlite"
+	"github.com/yuin/goldmark"
+	"github.com/yuin/goldmark/extension"
+	"github.com/yuin/goldmark/parser"
 )
 
 const schema = `
@@ -136,20 +140,46 @@ func handleFunc(s *Server, httpPath string, fn func(*Server, http.ResponseWriter
 }
 
 func m[Params, Result any](s *Server, method func(s *Server, params Params) (Result, error), paramsTmpl Params) jsonrpc.MethodParams {
-	m := func(params any) (any, error) { return method(s, params.(Params)) }
+	m := func(params any) (any, error) {
+		result, err := method(s, params.(Params))
+		if err != nil {
+			if s.C.DetailError {
+				return nil, errors.Errorf("%+v", err)
+			}
+			return nil, err
+		}
+		return result, nil
+	}
 	return jsonrpc.MethodParams{Method: m, Params: paramsTmpl}
 }
 
-//go:embed tmpl/index.html
+func mustRenderMarkdown(src []byte) template.HTML {
+	md := goldmark.New(
+		goldmark.WithExtensions(extension.GFM),
+		goldmark.WithParserOptions(parser.WithAutoHeadingID()),
+	)
+	var buf bytes.Buffer
+	if err := md.Convert(src, &buf); err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	return template.HTML(buf.String())
+}
+
+//go:embed tmpl/index/index.html
 var indexHTML string
 var indexTmpl = template.Must(template.New("").Parse(indexHTML))
 
+//go:embed tmpl/index/index.md
+var indexMD []byte
+var indexBody = mustRenderMarkdown(indexMD)
+
 func Index(s *Server, w http.ResponseWriter, r *http.Request) {
 	page := struct {
-	}{}
-	if err := indexTmpl.Execute(w, page); err != nil {
-		log.Printf("%+v", err)
+		Body template.HTML
+	}{
+		Body: indexBody,
 	}
+	indexTmpl.Execute(w, page)
 }
 
 func topup(s *Server, in api.TopupIn) (out Session, err error) {

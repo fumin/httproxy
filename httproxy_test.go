@@ -95,13 +95,14 @@ func newBackend(t *testing.T) *backend {
 	// Setup server.
 	b := &backend{}
 	cfg := config.Config{
-		Addr: ":0",
-		Root: t.TempDir(),
-		DB:   fmt.Sprintf("file:/%s?vfs=memdb", t.Name()),
-		XMR:  backendCfg.TestXMR0,
 		Secret: config.Secret{
 			Password: "x",
 		},
+		Addr:        ":0",
+		Root:        t.TempDir(),
+		DB:          fmt.Sprintf("file:/%s?vfs=memdb", t.Name()),
+		XMR:         backendCfg.TestXMR0,
+		DetailError: true,
 	}
 	var err error
 	b.s, err = NewServer(cfg)
