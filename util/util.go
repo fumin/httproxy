@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"math/big"
+	"os"
 	"reflect"
 	"strings"
 
@@ -22,6 +23,24 @@ func RandStr() string {
 	s := base58.Encode(b)
 
 	return string(c) + s
+}
+
+func WriteTemp(pattern string, data []byte) (string, error) {
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", errors.Wrap(err, "")
+	}
+	name := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(name)
+		return "", errors.Wrap(err, "")
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(name)
+		return "", errors.Wrap(err, "")
+	}
+	return name, nil
 }
 
 func ParseEnv(v any, r io.Reader) error {

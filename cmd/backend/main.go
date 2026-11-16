@@ -9,7 +9,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -20,36 +22,49 @@ import (
 )
 
 func mainWithErr() error {
-	signalCtx, unregisterSignal := signal.NotifyContext(context.Background(), os.Interrupt)
+	signalCtx, unregisterSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer unregisterSignal()
 
+	// Pin the current thread, in case Pdeathsig gets prematurely sent.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	// Start commands.
+	ctx, cancel := context.WithCancel(signalCtx)
 	numExited := 0
-	cmds, exits, err := startCmds()
+	cmds, exits, err := startCmds(ctx)
 	defer func() {
+		cancel()
 		for range len(cmds) - numExited {
 			<-exits
 		}
 	}()
 	if err != nil {
-		return errors.Wrap(err, "")
+		return err
 	}
-	if err := checkBackends(); err != nil {
-		return errors.Wrap(err, "")
+
+	// Wait for backends to start.
+	if err := checkBackends(ctx); err != nil {
+		return err
 	}
-	if err := createXMRWalletIfMissing(xmrWallet{name: "dev1"}); err != nil {
-		return errors.Wrap(err, "")
+	if err := createXMRWalletIfMissing(ctx, xmrWallet{name: "dev1"}); err != nil {
+		return err
 	}
 	log.Printf("backends started")
 
-	// Stop all commands upon receiving Ctrl-C or if any command prematurely exited.
+	// Return upon signaled, or if any command prematurely exited.
 	select {
 	case <-signalCtx.Done():
+		// Let a second signal kill us immediately.
 		unregisterSignal()
-		stopAll(cmds)
 	case ex := <-exits:
 		numExited++
-		stopAll(cmds)
+
+		// Ctrl-C broadcasts signals in no particular order, so our
+		// children may receive it earlier than us.
+		if signalCtx.Err() != nil {
+			return nil
+		}
 		return errors.Errorf("%s exited prematurely: %v", strings.Join(ex.cmd.Args, " "), ex.err)
 	}
 
@@ -65,7 +80,7 @@ func main() {
 	}
 }
 
-func checkBackends() error {
+func checkBackends(ctx context.Context) error {
 	start := time.Now()
 	var err error
 	for {
@@ -76,7 +91,13 @@ func checkBackends() error {
 		if time.Now().Sub(start) > 30*time.Second {
 			return err
 		}
-		<-time.After(time.Second)
+
+		// Sleep.
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "")
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -91,7 +112,7 @@ func checkBackendsOnce() error {
 
 const xmrWalletPassword = "regtest"
 
-func createXMRWalletIfMissing(w xmrWallet) error {
+func createXMRWalletIfMissing(ctx context.Context, w xmrWallet) error {
 	keyPath := w.file() + ".keys"
 	_, err := os.Stat(keyPath)
 	if err == nil {
@@ -101,13 +122,17 @@ func createXMRWalletIfMissing(w xmrWallet) error {
 		return errors.Wrap(err, "")
 	}
 
-	create := exec.Command("monero-wallet-cli",
+	create := exec.CommandContext(ctx, "monero-wallet-cli",
 		"--daemon-address", backendconfig.Default.Monerod,
 		"--generate-new-wallet", w.file(),
 		"--password", xmrWalletPassword,
 		"--mnemonic-language", "English",
 		"--log-file", "/dev/null",
 	)
+	create.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	// Interrupt instead of the default SIGKILL when ctx is done, so the wallet is not left half written.
+	create.Cancel = func() error { return create.Process.Signal(os.Interrupt) }
+	create.WaitDelay = 10 * time.Second
 	if err := create.Run(); err != nil {
 		return errors.Wrap(err, strings.Join(create.Args, " "))
 	}
@@ -145,12 +170,17 @@ type exitEvent struct {
 	err error
 }
 
-func startCmds() ([]*exec.Cmd, chan exitEvent, error) {
+func startCmds(ctx context.Context) ([]*exec.Cmd, chan exitEvent, error) {
 	exits := make(chan exitEvent)
 	cmds := make([]*exec.Cmd, 0)
-	start := func(args []string) error {
+	start := func(args ...string) error {
 		cmdStr := strings.Join(args, " ")
-		cmd := exec.Command(args[0], args[1:]...)
+		cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+		// Interrupt instead of the default SIGKILL, so that commands shutdown gracefully, such as wallets saving their state.
+		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+		// SIGKILL if a command has not exited in term after canceled.
+		cmd.WaitDelay = 10 * time.Second
 		if _, err := cmd.StdinPipe(); err != nil {
 			return errors.Wrap(err, cmdStr)
 		}
@@ -162,21 +192,24 @@ func startCmds() ([]*exec.Cmd, chan exitEvent, error) {
 		return nil
 	}
 
-	if err := start([]string{"monerod", "--regtest", "--offline", "--fixed-difficulty=1", "--keep-fakechain"}); err != nil {
+	// Start monerod.
+	if err := start("monerod", "--regtest", "--offline", "--fixed-difficulty=1", "--keep-fakechain"); err != nil {
 		return cmds, exits, errors.Wrap(err, "")
 	}
-	if err := waitMonerod(); err != nil {
+	if err := waitMonerod(ctx); err != nil {
 		return cmds, exits, errors.Wrap(err, "")
 	}
 
+	// Start wallet RPCs.
 	for _, w := range xmrWallets() {
 		if err := os.MkdirAll(w.dir(), 0700); err != nil {
 			return cmds, exits, errors.Wrap(err, "")
 		}
-		if err := createXMRWalletIfMissing(w); err != nil {
+		if err := createXMRWalletIfMissing(ctx, w); err != nil {
 			return cmds, exits, errors.Wrap(err, w.name)
 		}
-		if err := start(moneroRPCCmd(w)); err != nil {
+		// SIGKILL instead of SIGTERM, since upon SIGTERM, monero-wallet-rpc sometimes hangs.
+		if err := start(moneroRPCCmd(w)...); err != nil {
 			return cmds, exits, errors.Wrap(err, "")
 		}
 	}
@@ -184,7 +217,7 @@ func startCmds() ([]*exec.Cmd, chan exitEvent, error) {
 	return cmds, exits, nil
 }
 
-func waitMonerod() error {
+func waitMonerod(ctx context.Context) error {
 	node, err := monero.NewNode(backendconfig.Default.Monerod)
 	if err != nil {
 		return errors.Wrap(err, "")
@@ -198,7 +231,13 @@ func waitMonerod() error {
 		if time.Since(start) > 30*time.Second {
 			return errors.Wrap(err, "monerod did not start")
 		}
-		<-time.After(time.Second)
+
+		// Sleep.
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "")
+		case <-time.After(time.Second):
+		}
 	}
 }
 
@@ -221,15 +260,4 @@ func moneroRPCCmd(w xmrWallet) []string {
 		// Somehow version 0.18.5.4 needs this
 		"--allow-mismatched-daemon-version",
 	}
-}
-
-func stopAll(cmds []*exec.Cmd) {
-	for _, c := range cmds {
-		c.Process.Signal(os.Interrupt)
-	}
-	time.AfterFunc(10*time.Second, func() {
-		for _, c := range cmds {
-			c.Process.Kill()
-		}
-	})
 }

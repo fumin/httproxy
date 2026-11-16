@@ -23,3 +23,10 @@ Before developing and testing, make sure to
 
 * create a file "./secret" in `key=value` format, populating the `config.Secret` struct.
 * run `cmd/backend` to start the monero node and other backends.
+
+## TODO
+
+* --overlay2 root:memory
+* --ignore-cgroups
+* util/gvisor package comments explaining the layers
+* use https://gvisor.dev/docs/sdk/go/quickstart/ to Exec a bash
