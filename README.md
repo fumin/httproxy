@@ -17,6 +17,8 @@ kill $(lsof -t -i :28877)
 $GOPATH/bin/httproxy -c=prod > $HOME/var/httproxy/log 2>&1 &
 ```
 
+To backup the database, run `sqlite3 sqlite.db "VACUUM INTO 'backup_$(date +%Y%m%d_%H%M%S).db'"`
+
 ## Develop
 
 Before developing and testing, make sure to
@@ -25,8 +27,3 @@ Before developing and testing, make sure to
 * run `cmd/backend` to start the monero node and other backends.
 
 ## TODO
-
-* --overlay2 root:memory
-* --ignore-cgroups
-* util/gvisor package comments explaining the layers
-* use https://gvisor.dev/docs/sdk/go/quickstart/ to Exec a bash
