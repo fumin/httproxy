@@ -1,27 +1,26 @@
-// The layers, outermost first:
-//   - systemd-run --user --scope: a cgroup with memory, CPU and task limits for everything below.
-//   - pasta: a private user and network namespace with internet access. Port forwarding and the
-//     gateway-to-host-loopback mapping are disabled, so the sandbox cannot reach the host's
-//     localhost.
-//   - prohibit routes in pasta's namespace for the blocked ranges and the gateway. pasta's
-//     namespace forwards the sandbox's traffic, so the kernel applies these routes to every packet
-//     the sandbox sends. IPv4 connections to blocked ranges fail immediately with "No route to
-//     host". IPv6 connections are blocked too, but hang until the caller's timeout, since gVisor
-//     ignores the ICMPv6 "administratively prohibited" errors that the kernel sends back.
-//   - an inner network namespace, linked to pasta's by a veth pair, for runsc. Since the firewall
-//     is in a different network namespace, neither the sandboxed processes nor a process that
-//     escapes gVisor into the Sentry can change it. The Sentry also runs in a user namespace nested
-//     inside pasta's, so it has no capabilities over either network namespace.
-//   - runsc --network=sandbox run: gVisor with its own network stack on the inner namespace's veth,
-//     started from an OCI bundle with a minimal root filesystem plus read-only binds of the allowed
-//     host paths. Writes to the root filesystem go to an in-memory overlay.
+// Package gvisor runs a gVisor sentry.
+//
+// Security layers starting from the outermost:
+//   - Pasta, reads layer-2 ethernet network packets from the network interface
+//     `vout` and translates them into layer-4 TCP/UDP packets which are sent to
+//     the external internet through the host's network interface `eth0`.
+//     Without root privileges, layer-4 packets are the only thing accepted by
+//     `eth0`. This explains why Pasta is needed in our rootless solution here.
+//   - An outer network namespace, created by Pasta. This namespace contains
+//     firewall rules that allow only packets to the external internet and blocks
+//     everything to LAN, thus achieving network isolation.
+//   - An inner network namespace, where both the network interface `vin` and
+//     runsc's sentry reside. This inner namespace is separated from the outer
+//     namespace where the aforementioned firewall resides. This ensures that the
+//     firewall cannot be edited by a guest who escapes gVisor into the sentry.
+//   - gVisor and its sentry started by runsc. gVisor uses its own network stack
+//     which prevents guests from exploiting bugs in Linux's networking code.
 package gvisor
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -38,13 +37,6 @@ import (
 )
 
 const (
-	// Binaries used.
-	pastaBin   = "/usr/bin/pasta"
-	runscBin   = "/usr/bin/runsc"
-	ipBin      = "/usr/bin/ip"
-	unshareBin = "/usr/bin/unshare"
-	nsenterBin = "/usr/bin/nsenter"
-
 	// Settings in pasta's network namespace.
 	nsIfname = "eth0"
 	nsAddr4  = "10.255.255.2"
@@ -62,28 +54,42 @@ const (
 	// File descriptors through which the inner script reaches pasta's network namespace and its own.
 	pastaNsFd = 3
 	innerNsFd = 4
+
+	// Binaries used.
+	pastaBin   = "/usr/bin/pasta"
+	runscBin   = "/usr/bin/runsc"
+	ipBin      = "/usr/bin/ip"
+	unshareBin = "/usr/bin/unshare"
+	nsenterBin = "/usr/bin/nsenter"
+	ncBin      = "/usr/bin/nc"
+	sleepBin   = "/usr/bin/sleep"
 )
 
-type config struct {
-	// binds are host paths visible read-only at the same path inside the sandbox.
-	binds      []string
-	resolvConf string
-	// blocked are destination ranges the sandbox cannot connect to, in addition to the gateway.
-	blocked []string
+// Config configures a sandbox.
+type Config struct {
+	// Binds are host paths visible read-only inside the sandbox.
+	Binds []string
+	// ResolvConf is the content of /etc/resolv.conf inside the sandbox.
+	ResolvConf string
+	// Blocked are destination ranges the sandbox cannot connect to.
+	Blocked []string
 
-	memoryMax uint64
-	// cpuQuota is the percentage of one CPU.
-	cpuQuota int
-	tasksMax int
-	nofile   int
+	// CPUQuota is the percentage of one CPU.
+	CPUQuota int
+	// MemoryMax is the maximum memory in bytes.
+	MemoryMax uint64
+	// TasksMax is the maximum number of threads.
+	TasksMax int
 
-	execBin string
-	env     []string
+	// Env is the environment of processes run by Sandbox.Exec.
+	Env []string
 }
 
-func defaultConfig() config {
-	return config{
-		binds: []string{
+// DefaultConfig returns a Config for running a shell without access to the
+// local area network.
+func DefaultConfig() Config {
+	return Config{
+		Binds: []string{
 			"/lib/x86_64-linux-gnu",
 			"/lib64",
 			"/bin",
@@ -96,25 +102,22 @@ func defaultConfig() config {
 			"/usr/share/vim",
 			"/etc/vim",
 		},
-		resolvConf: "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+		ResolvConf: "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
 		// Local area networks.
-		blocked: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"},
+		Blocked: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"},
 
-		memoryMax: 64 << 20,
-		cpuQuota:  50,
-		tasksMax:  256,
-		nofile:    64,
+		MemoryMax: 64 << 20,
+		CPUQuota:  50,
+		TasksMax:  256,
 
-		execBin: "/bin/bash",
-		env:     []string{"PATH=/usr/bin:/bin"},
+		Env: []string{"PATH=/usr/bin:/bin"},
 	}
 }
 
-func Run(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	return run(ctx, defaultConfig(), stdin, stdout, stderr)
-}
-
-func run(ctx context.Context, cfg config, stdin io.Reader, stdout, stderr io.Writer) error {
+// run runs the sandbox until its main process exits or ctx is done.
+// started is called with the container ID, runsc's state directory, and the
+// host PID of the `runsc run` process, once the container has started.
+func run(ctx context.Context, cfg Config, started func(id, state string, runscPid int)) error {
 	id := "gvisor-" + util.RandStr()
 	dir, err := os.MkdirTemp("", id)
 	if err != nil {
@@ -122,54 +125,134 @@ func run(ctx context.Context, cfg config, stdin io.Reader, stdout, stderr io.Wri
 	}
 	defer os.RemoveAll(dir)
 
-	runscArgs, err := makeRunscArgs(id, dir, cfg)
+	// Create the listener that will be notified when runsc has started.
+	poststart, err := newPoststartListener(dir)
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
-	pastaArgs, err := makePastaArgs(cfg.blocked, runscArgs)
-	if err != nil {
-		return errors.Wrap(err, "")
-	}
-	unit := id + ".scope"
-	args := []string{
-		"systemd-run", "--user", "--scope", "--quiet", "--collect",
-		// Pass the command through unchanged, instead of expanding $VAR in it.
-		"--expand-environment=no",
-		"--unit=" + unit,
-		"-p", fmt.Sprintf("MemoryMax=%d", cfg.memoryMax),
-		"-p", "MemorySwapMax=0",
-		"-p", fmt.Sprintf("CPUQuota=%d%%", cfg.cpuQuota),
-		"-p", fmt.Sprintf("TasksMax=%d", cfg.tasksMax),
-		"-p", "TimeoutStopSec=5s",
-	}
-	args = append(args, pastaArgs...)
+	defer poststart.Close()
 
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	cmd.Cancel = func() error {
-		if err := stopUnit(unit); err != nil {
-			return cmd.Process.Signal(syscall.SIGTERM)
-		}
-		return nil
+	// Create command arguments.
+	runscArgs, err := makeRunscArgs(id, dir, poststart.Socket(), cfg)
+	if err != nil {
+		return errors.Wrap(err, "")
 	}
-	cmd.WaitDelay = 10 * time.Second
-	// Kill child if we die before canceling ctx, such as by SIGKILL.
+	pastaArgs, err := makePastaArgs(cfg.Blocked, runscArgs)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+
+	// Create cmd so that the entire process tree is killed once we exit.
+	// This is done by setting Pdeathsig which kills our direct child.
+	// makePidnsArgs then makes sure all descendants are killed by making
+	// that child PID 1.
+	unit := id + ".scope"
+	args := append(makeSystemdArgs(unit, cfg), makePidnsArgs()...)
+	args = append(args, pastaArgs...)
+	runCtx, cancelCmd := context.WithCancel(ctx)
+	defer cancelCmd()
+	cmd := exec.CommandContext(runCtx, args[0], args[1:]...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Killing pasta leaves runsc running, so always stop the whole scope.
-	defer stopUnit(unit)
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			// We were asked to stop, and the sandbox has stopped.
-			return nil
-		}
+	stderrBuf := util.NewTailBuffer(4096)
+	cmd.Stderr = stderrBuf
+	cmd.WaitDelay = 5 * time.Second
+	if err := cmd.Start(); err != nil {
 		return errors.Wrap(err, strings.Join(cmd.Args, " "))
 	}
+
+	// Wait on cmd in the background.
+	poststartCtx, cancelPoststart := context.WithCancel(ctx)
+	defer cancelPoststart()
+	cmdErrChan := make(chan error, 1)
+	go func() {
+		cmdErrChan <- cmd.Wait()
+		cancelPoststart()
+	}()
+
+	// Wait for the poststart hook.
+	poststartOk := func(runscPid int) {
+		started(id, filepath.Join(dir, "state"), runscPid)
+	}
+	poststartErr := poststart.Listen(poststartCtx, poststartOk)
+	if poststartErr != nil {
+		cancelCmd() // cmd no longer needs to run if poststart fails
+	}
+
+	// Collect cmd's exit information.
+	runErr := <-cmdErrChan
+	// Clean up systemd.
+	systemdRes, err := systemdCleanup(unit)
+	if err != nil {
+		return errors.Wrap(err, "")
+	}
+
+	// Report errors.
+	//
+	// runsc was asked to stop, and has stopped.
+	if ctx.Err() != nil {
+		return nil
+	}
+	// runsc got OOM killed.
+	if systemdRes == "oom-kill" {
+		return errors.Errorf("sandbox killed for exceeding MemoryMax=%d", cfg.MemoryMax)
+	}
+	// runsc's poststart hook failed.
+	if poststartErr != nil {
+		return errors.Wrap(poststartErr, "")
+	}
+	// runsc itself failed.
+	if runErr != nil {
+		return errors.Wrapf(runErr, "%s\nstderr: %s", strings.Join(cmd.Args, " "), stderrBuf)
+	}
 	return nil
+}
+
+func makeSystemdArgs(unit string, cfg Config) []string {
+	return []string{
+		"systemd-run", "--user", "--scope", "--quiet",
+		"--unit=" + unit,
+		"-p", fmt.Sprintf("MemoryMax=%d", cfg.MemoryMax),
+		"-p", "MemorySwapMax=0",
+		"-p", fmt.Sprintf("CPUQuota=%d%%", cfg.CPUQuota),
+		"-p", fmt.Sprintf("TasksMax=%d", cfg.TasksMax),
+	}
+}
+
+// systemdCleanup returns the result of unit, such as "success" or "oom-kill".
+func systemdCleanup(unit string) (string, error) {
+	out, err := exec.Command("systemctl", "--user", "show", "--property=Result", "--value", unit).Output()
+	if err != nil {
+		return "", errors.Wrap(err, "")
+	}
+	result := strings.TrimSpace(string(out))
+
+	if result != "success" {
+		// Clean up data held by systemd about the failed unit.
+		if out, err := exec.Command("systemctl", "--user", "reset-failed", unit).CombinedOutput(); err != nil {
+			return "", errors.Wrap(err, string(out))
+		}
+	}
+	return result, nil
+}
+
+// makePidnsArgs returns a command that runs whatever follows as PID 1.
+// This is achieved by creating a new PID namespace.
+// When a PID 1 process of a namespace dies, the kernel kills all process of that namespace.
+func makePidnsArgs() []string {
+	return []string{
+		unshareBin,
+		// Creating a PID namespace without root requires a user namespace.
+		"--user", "--map-current-user",
+		// Create a PID namespace.
+		"--pid",
+		// Ensure child process is killed when unshare dies.
+		"--kill-child",
+		// Mount /proc as some processes need this, such as https://passt.top/
+		"--mount-proc",
+		"--"}
 }
 
 func makePastaArgs(blocked, runcmd []string) ([]string, error) {
@@ -243,7 +326,7 @@ func pastaScript(blocked, cmd []string) (string, error) {
 	}...)
 
 	// Run the inner script in a new network namespace, with pasta's
-	// namespace open as file descriptor pastaNsFd.
+	// namespace opened as file descriptor pastaNsFd.
 	lines = append(lines,
 		fmt.Sprintf("exec %d</proc/self/ns/net", pastaNsFd),
 		"exec "+unshareBin+" --net -- /bin/sh -c "+shellQuote(innerScript(cmd)))
@@ -251,10 +334,7 @@ func pastaScript(blocked, cmd []string) (string, error) {
 	return strings.Join(lines, "\n") + "\n", nil
 }
 
-// innerScript returns a script that runs in runsc's network namespace, with
-// pasta's namespace open as file descriptor pastaNsFd. It moves the inner end
-// of the veth pair into its own namespace, which it opens as file descriptor
-// innerNsFd, configures the veth, and then executes cmd.
+// innerScript returns a script that sets up the inner network namespace, then runs cmd.
 func innerScript(cmd []string) string {
 	lines := []string{
 		"set -eu",
@@ -291,67 +371,77 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-func makeRunscArgs(id, dir string, cfg config) ([]string, error) {
+func makeRunscArgs(id, dir, poststartSock string, cfg Config) ([]string, error) {
 	// The OCI bundle, with config.json and the root filesystem.
+	// https://github.com/opencontainers/runtime-spec/blob/main/runtime.md
 	bundle := filepath.Join(dir, "bundle")
 	// runsc's container state, which is not part of the bundle.
 	state := filepath.Join(dir, "state")
 
-	if err := makeBundle(bundle, cfg); err != nil {
+	if err := makeBundle(bundle, poststartSock, cfg); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
 	runscArgs := []string{runscBin,
 		"--network=sandbox",
-		// The systemd scope sets the resource limits.
-		"--ignore-cgroups",
 		"--root", state,
 		// The root filesystem is writable, but writes stay in sandbox memory, which the scope's MemoryMax limits.
 		"--overlay2", "root:memory",
+		// Without root, runsc cannot create cgroups.
+		"--ignore-cgroups",
 		"run", "--bundle", bundle, id}
 	return runscArgs, nil
 }
 
-func makeBundle(bundle string, cfg config) error {
+func makeBundle(bundle, poststartSock string, cfg Config) error {
 	rootfs := filepath.Join(bundle, "rootfs")
 	binds, err := makeRootfs(rootfs, cfg)
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
-	if err := writeSpec(bundle, newSpec(cfg, binds)); err != nil {
+	if err := writeSpec(bundle, newSpec(cfg, binds, poststartSock)); err != nil {
 		return errors.Wrap(err, "")
 	}
 	return nil
 }
 
-func newSpec(cfg config, binds []specs.Mount) *specs.Spec {
+func newSpec(cfg Config, binds []specs.Mount, poststartSock string) *specs.Spec {
+	// notifySock forwards info provided by runsc to poststartSock.
+	notifySock := specs.Hook{
+		Path:    ncBin,
+		Args:    []string{ncBin, "-U", poststartSock},
+		Timeout: new(10), // seconds
+	}
+
 	// runsc is being run in pasta's user namespace,
 	// thus the effective UID/GID mapping the sentry's uid_map is 0.
 	// For more info, see the section "Configuring the OCI Spec" in
 	// https://gvisor.dev/docs/user_guide/rootless/
 	const effectiveHostID = 0
+	linux := &specs.Linux{
+		Namespaces: []specs.LinuxNamespace{
+			{Type: specs.UserNamespace},
+			// runsc's own network namespace, which has the inner end of the veth pair.
+			{Type: specs.NetworkNamespace, Path: "/proc/self/ns/net"},
+		},
+		UIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: effectiveHostID, Size: 1}},
+		GIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: effectiveHostID, Size: 1}},
+	}
 
-	nofile := uint64(cfg.nofile)
 	return &specs.Spec{
 		Version: specs.Version,
 		Process: &specs.Process{
-			Args:            []string{cfg.execBin},
-			Env:             cfg.env,
+			Args:            []string{sleepBin, "infinity"},
+			Env:             cfg.Env,
 			Cwd:             "/",
-			Rlimits:         []specs.POSIXRlimit{{Type: "RLIMIT_NOFILE", Hard: nofile, Soft: nofile}},
 			NoNewPrivileges: true,
 		},
 		Root:     &specs.Root{Path: "rootfs"},
 		Hostname: "sandbox",
 		Mounts:   binds,
-		Linux: &specs.Linux{
-			Namespaces: []specs.LinuxNamespace{
-				{Type: specs.UserNamespace},
-				// runsc's own network namespace, which has the inner end of the veth pair.
-				{Type: specs.NetworkNamespace, Path: "/proc/self/ns/net"},
-			},
-			UIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: effectiveHostID, Size: 1}},
-			GIDMappings: []specs.LinuxIDMapping{{ContainerID: 0, HostID: effectiveHostID, Size: 1}},
+		Hooks: &specs.Hooks{
+			Poststart: []specs.Hook{notifySock},
 		},
+		Linux: linux,
 	}
 }
 
@@ -366,17 +456,17 @@ func writeSpec(bundle string, s *specs.Spec) error {
 	return nil
 }
 
-func makeRootfs(rootfs string, cfg config) ([]specs.Mount, error) {
+func makeRootfs(rootfs string, cfg Config) ([]specs.Mount, error) {
 	if err := os.MkdirAll(filepath.Join(rootfs, "etc"), 0755); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
-	if err := os.WriteFile(filepath.Join(rootfs, "etc", "resolv.conf"), []byte(cfg.resolvConf), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(rootfs, "etc", "resolv.conf"), []byte(cfg.ResolvConf), 0644); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
 
 	binds := make([]specs.Mount, 0)
 	seen := make(map[string]struct{})
-	for _, p := range cfg.binds {
+	for _, p := range cfg.Binds {
 		p = filepath.Clean(p)
 		realP, err := filepath.EvalSymlinks(p)
 		if err != nil {
@@ -435,16 +525,6 @@ func makeMountPoint(rootfs, realP string) error {
 		if err := os.WriteFile(dst, nil, 0644); err != nil {
 			return errors.Wrap(err, "")
 		}
-	}
-	return nil
-}
-
-func stopUnit(unit string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", "--user", "stop", unit).CombinedOutput()
-	if err != nil && !strings.Contains(string(out), "not loaded") {
-		return errors.Wrap(err, string(out))
 	}
 	return nil
 }

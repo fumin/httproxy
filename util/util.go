@@ -6,7 +6,9 @@ import (
 	"io"
 	"math/big"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 
 	"github.com/btcsuite/btcd/address/v2/base58"
@@ -84,4 +86,22 @@ func ParseEnv(v any, r io.Reader) error {
 		return errors.Wrap(err, "")
 	}
 	return nil
+}
+
+// ParentPid returns the PID of pid's parent.
+func ParentPid(pid int) (int, error) {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+	if err != nil {
+		return 0, errors.Wrap(err, "")
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "PPid:"); ok {
+			ppid, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				return 0, errors.Wrap(err, line)
+			}
+			return ppid, nil
+		}
+	}
+	return 0, errors.Errorf("no PPid in %s", b)
 }

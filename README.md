@@ -26,7 +26,5 @@ Before developing and testing, make sure to
 
 ## TODO
 
-* --overlay2 root:memory
-* --ignore-cgroups
-* util/gvisor package comments explaining the layers
 * use https://gvisor.dev/docs/sdk/go/quickstart/ to Exec a bash
+* --overlay2 root:memory
