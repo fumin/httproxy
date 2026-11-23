@@ -7,14 +7,41 @@
 <body>
 {{template "navbar" .Common.Navbar}}
 
-<div id="new-voucher">
-	<button>new voucher</button>
+<div id="deal-vm-voucher">
+	<button>deal vm voucher</button>
 	<pre></pre>
 </div>
 
-{{range $_, $s := .Vouchers}}
-	<div>ID: {{$s.ID}}, UsageLimit: {{$s.UsageLimit}}, Usage: {{$s.Usage}}, CreateAt: {{$s.CreateAt}}</div>
-{{end}}
+<table>
+	<thead>
+		<tr><th>ID</th><th>UsageLimit</th><th>Usage</th><th>CreateAt</th><th>Running</th></tr>
+	</thead>
+	<tbody>
+	{{range $_, $m := .VMs}}
+		<tr><td>{{$m.ID}}</td><td>{{$m.UsageLimit}}</td><td>{{$m.Usage}}</td><td>{{$m.CreateAt.Format "2006-01-02 15:04:05 MST"}}</td><td>{{$m.Running}}</td></tr>
+	{{else}}
+		<tr><td colspan="5">no VMs</td></tr>
+	{{end}}
+	</tbody>
+</table>
+
+<div id="deal-proxy-voucher">
+	<button>deal proxy voucher</button>
+	<pre></pre>
+</div>
+
+<table>
+	<thead>
+		<tr><th>ID</th><th>UsageLimit</th><th>Usage</th><th>CreateAt</th></tr>
+	</thead>
+	<tbody>
+	{{range $_, $s := .ProxyVouchers}}
+		<tr><td>{{$s.ID}}</td><td>{{$s.UsageLimit}}</td><td>{{$s.Usage}}</td><td>{{$s.CreateAt.Format "2006-01-02 15:04:05 MST"}}</td></tr>
+	{{else}}
+		<tr><td colspan="4">no proxy vouchers</td></tr>
+	{{end}}
+	</tbody>
+</table>
 
 <script type="importmap">
 {"imports": {
@@ -44,7 +71,8 @@ function addRPC(selector, method, params) {
 	});
 }
 
-addRPC("#new-voucher", "deal_voucher");
+addRPC("#deal-vm-voucher", "dealVMVoucher");
+addRPC("#deal-proxy-voucher", "dealProxyVoucher");
 </script>
 </body>
 </html>

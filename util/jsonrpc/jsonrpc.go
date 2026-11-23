@@ -74,7 +74,7 @@ func Do(url, method string, params, result any, header http.Header) error {
 	return nil
 }
 
-type Method func(any) (any, error)
+type Method func(context.Context, any) (any, error)
 type MethodParams struct {
 	Method Method
 	Params any
@@ -93,7 +93,7 @@ func NewHandler(methods map[string]MethodParams, auth Authorizer) func(w http.Re
 		}
 
 		w.Header().Set("Content-Type", "application/json")
-		result, err := handle(methods, r.Body)
+		result, err := handle(r.Context(), methods, r.Body)
 		if err != nil {
 			json.MarshalWrite(w, response{Error: err}, jsonOpts)
 			return
@@ -107,7 +107,7 @@ type response struct {
 	Result any       `json:"result,omitzero"`
 }
 
-func handle(methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
+func handle(ctx context.Context, methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
 	// Parse method.
 	req := struct {
 		Method string         `json:"method"`
@@ -131,7 +131,7 @@ func handle(methods map[string]MethodParams, body io.Reader) (any, *RPCError) {
 	params := paramsPtr.Elem().Interface()
 
 	// Invoke method.
-	result, err := m.Method(params)
+	result, err := m.Method(ctx, params)
 	if err != nil {
 		return nil, &RPCError{Code: -1, Message: err.Error()}
 	}

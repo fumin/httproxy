@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/pkg/errors"
@@ -33,17 +34,19 @@ func mainWithErr() error {
 		return errors.Wrap(err, "")
 	}
 
-	s, err := httproxy.NewServer(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, err := httproxy.NewServer(ctx, cfg)
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
 	defer s.Close()
 
 	// Start server.
-	ctrlCCtx, revertSignalHandling := signal.NotifyContext(context.Background(), os.Interrupt)
+	stopCtx, revertSignalHandling := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer revertSignalHandling()
 	go func() {
-		<-ctrlCCtx.Done()
+		<-stopCtx.Done()
 		revertSignalHandling()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

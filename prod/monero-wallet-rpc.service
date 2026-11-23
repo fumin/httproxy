@@ -1,0 +1,32 @@
+# Usage: copy to ~/.config/systemd/user/ then run:
+#   systemctl --user daemon-reload
+#   systemctl --user enable monero-wallet-rpc.service
+#
+# Variables:
+# MONERO_NODE
+# WALLET_FILE
+# PASSWORD_FILE
+
+[Unit]
+Description=Monero wallet RPC for httproxy
+
+[Service]
+# host:port of the Monero node.
+Environment=NODE=MONERO_NODE
+# User units cannot wait for network-online.target, so wait until the node's host resolves.
+# $$ and %% are a literal $ and %, so that the shell strips the port.
+ExecStartPre=/bin/sh -c 'until getent hosts "$${NODE%%:*}" >/dev/null; do sleep 1; done'
+TimeoutStartSec=120
+ExecStart=monero-wallet-rpc \
+    --daemon-address ${NODE} \
+    --wallet-file WALLET_FILE \
+    --password-file PASSWORD_FILE \
+    --log-file %h/var/httproxy/rpc.log \
+    --rpc-bind-ip 127.0.0.1 --rpc-bind-port 28088 \
+    --non-interactive
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

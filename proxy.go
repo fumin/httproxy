@@ -2,16 +2,71 @@ package httproxy
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
+	"html/template"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/fumin/httproxy/api"
+	"github.com/fumin/httproxy/util"
+	"github.com/pkg/errors"
 )
+
+func ProxyTopup(ctx context.Context, s *Server, in api.ProxyTopupIn) (out Session, err error) {
+	received, err := xmrReceived(s.XMR, s.XMRAddr, in.PaymentTx)
+	if err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	usageLimit := received / api.ProxyPriceXMRPicoPerByte
+
+	newSession := false
+	sessionID := in.SessionID
+	if sessionID == "" {
+		newSession = true
+		sessionID = util.RandStr()
+	}
+
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, "INSERT INTO payment (method, tx, service, serviceID) VALUES (?, ?, ?, ?)", in.Method, in.PaymentTx, serviceProxy, sessionID); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	if newSession {
+		if _, err := tx.ExecContext(ctx, "INSERT INTO proxy_session (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", sessionID, usageLimit, 0, time.Now().Unix()); err != nil {
+			return out, errors.Wrap(err, "")
+		}
+	} else {
+		if _, err := tx.ExecContext(ctx, "UPDATE proxy_session SET usageLimit=usageLimit+? WHERE id=?", usageLimit, sessionID); err != nil {
+			return out, errors.Wrap(err, "")
+		}
+	}
+	if err := tx.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM proxy_session WHERE id=?", sessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+
+	if err := tx.Commit(); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+
+	return
+}
+
+func ProxyUsage(ctx context.Context, s *Server, in api.ProxyUsageIn) (out Session, err error) {
+	if err := s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM proxy_session WHERE id=?", in.SessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+	return
+}
 
 func ProxyHTTP(s *Server, w http.ResponseWriter, r *http.Request) {
 	sessionID, ok := getProxySession(s, w, r)
@@ -34,7 +89,7 @@ func ProxyHTTP(s *Server, w http.ResponseWriter, r *http.Request) {
 	cw := &countWriter{w: w}
 	rp.ServeHTTP(cw, r)
 
-	addUsage(s, sessionID, body.n.Load()+cw.n.Load())
+	addUsage(r.Context(), s, sessionID, body.n.Load()+cw.n.Load())
 }
 
 func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
@@ -77,15 +132,34 @@ func Proxy(s *Server, w http.ResponseWriter, r *http.Request) {
 	go func() { n, err := io.Copy(client, target); c <- copyOut{n: n, err: err} }()
 	co0 := <-c
 	target.Close()
-	// Unblock the other io.Copy without closing the client connection, so
-	// that usage is recorded before the client observes the conn close.
 	conn.SetDeadline(time.Now())
 	co1 := <-c
 
 	var usage int64
 	usage += co0.n
 	usage += co1.n
-	addUsage(s, sessionID, usage)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	addUsage(ctx, s, sessionID, usage)
+}
+
+//go:embed tmpl/proxydoc/proxydoc.html
+var proxyDocHTML string
+var proxyDocTmpl = template.Must(commonTmpl().Parse(proxyDocHTML))
+
+//go:embed tmpl/proxydoc/proxydoc.md
+var proxyDocMD []byte
+var proxyDocBody = mustRenderMarkdown(proxyDocMD)
+
+func ProxyDoc(s *Server, w http.ResponseWriter, r *http.Request) {
+	page := struct {
+		Common pageCommon
+		Body   template.HTML
+	}{
+		Common: getPageCommon(s, r),
+		Body:   proxyDocBody,
+	}
+	proxyDocTmpl.Execute(w, page)
 }
 
 func getProxySession(s *Server, w http.ResponseWriter, r *http.Request) (string, bool) {
@@ -104,9 +178,9 @@ func getProxySession(s *Server, w http.ResponseWriter, r *http.Request) (string,
 	if strings.HasPrefix(sessionID, voucherPrefix) {
 		ss, err = s.vouchers.get(sessionID)
 	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
-		err = s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage)
+		err = s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM proxy_session WHERE id=?", sessionID).Scan(&ss.ID, &ss.UsageLimit, &ss.Usage)
 	}
 	if err != nil {
 		w.Header().Set("Proxy-Authenticate", `Basic realm="payment_required"`)
@@ -123,18 +197,17 @@ func getProxySession(s *Server, w http.ResponseWriter, r *http.Request) (string,
 	return sessionID, true
 }
 
-func addUsage(s *Server, sessionID string, usage int64) {
+func addUsage(ctx context.Context, s *Server, sessionID string, usage int64) error {
 	var err error
 	if strings.HasPrefix(sessionID, voucherPrefix) {
 		s.vouchers.use(sessionID, usage)
 	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_, err = s.DB.ExecContext(ctx, "UPDATE session SET usage=usage+? WHERE id=?", usage, sessionID)
+		_, err = s.DB.ExecContext(ctx, "UPDATE proxy_session SET usage=usage+? WHERE id=?", usage, sessionID)
 	}
 	if err != nil {
-		log.Printf("update usage error for session %s usage %d: %s", sessionID, usage, err)
+		return errors.Wrap(err, "")
 	}
+	return nil
 }
 
 type countReader struct {

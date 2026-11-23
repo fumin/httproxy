@@ -1,13 +1,18 @@
 package httproxy
 
 import (
+	"context"
 	"crypto/subtle"
 	_ "embed"
+	"fmt"
 	"html/template"
 	"net/http"
 	"net/url"
+	"time"
 
+	"github.com/fumin/httproxy/util"
 	"github.com/fumin/httproxy/util/jsonrpc"
+	"github.com/pkg/errors"
 )
 
 const (
@@ -18,14 +23,10 @@ const (
 	PathAdminRPC     = "/admin/json_rpc"
 )
 
-func dealVoucher(s *Server, in struct{}) (Session, error) {
-	ss := s.vouchers.deal()
-	return ss, nil
-}
-
 func handleAdmin(s *Server) {
 	adminMethods := map[string]jsonrpc.MethodParams{
-		"deal_voucher": m(s, dealVoucher, struct{}{}),
+		"dealVMVoucher":    m(s, dealVMVoucher, struct{}{}),
+		"dealProxyVoucher": m(s, dealProxyVoucher, struct{}{}),
 	}
 	s.ServeMux.HandleFunc(PathAdminRPC, jsonrpc.NewHandler(adminMethods, s.auth))
 
@@ -33,6 +34,36 @@ func handleAdmin(s *Server) {
 	handleFunc(s, PathAdminLoginDo, AdminLoginDo)
 	handleFunc(s, PathAdminLogout, AdminLogout)
 	handleFunc(s, PathAdminIndex, AdminIndex)
+}
+
+func dealVMVoucher(ctx context.Context, s *Server, in struct{}) (out VM, err error) {
+	if !s.vmService.HasSpareCapacity() {
+		return out, errors.Errorf("no capacity")
+	}
+
+	const usageLimit = 3 * 24 * time.Hour
+	out.ID = "voucher_" + util.RandStr()
+	out.UsageLimit = int(usageLimit.Seconds())
+	if _, err := s.DB.ExecContext(ctx, "INSERT INTO vm (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", out.ID, out.UsageLimit, out.Usage, time.Now().Unix()); err != nil {
+		return out, errors.Wrap(err, "")
+	}
+
+	started, err := s.vmService.Put(out.ID)
+	if err != nil {
+		return out, nil
+	}
+	select {
+	case <-ctx.Done():
+	case <-started:
+	}
+	out.Running = (s.vmService.Get(out.ID) != nil)
+
+	return
+}
+
+func dealProxyVoucher(ctx context.Context, s *Server, in struct{}) (Session, error) {
+	ss := s.vouchers.deal()
+	return ss, nil
 }
 
 //go:embed tmpl/admin/navbar.html
@@ -61,12 +92,6 @@ func getAdminCommon(s *Server, r *http.Request) adminCommon {
 	return c
 }
 
-type navbar struct {
-	LoggedIn   bool
-	PathLogin  string
-	PathLogout string
-}
-
 //go:embed tmpl/admin/login.html
 var adminLoginHTML string
 var adminLoginTmpl = template.Must(adminCommonTmpl().Parse(adminLoginHTML))
@@ -89,7 +114,7 @@ func AdminLoginDo(s *Server, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	password := r.FormValue("password")
-	if subtle.ConstantTimeCompare([]byte(password), []byte(s.C.Secret.Password)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(password), []byte(s.C.Secret.Password.Reveal())) != 1 {
 		http.Error(w, "", http.StatusForbidden)
 		return
 	}
@@ -114,14 +139,25 @@ func AdminIndex(s *Server, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	vms, err := runnableVMs(r.Context(), s.DB)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("%+v", err), http.StatusInternalServerError)
+		return
+	}
+	for i, m := range vms {
+		vms[i].Running = (s.vmService.Get(m.ID) != nil)
+	}
+
 	page := struct {
-		Common   adminCommon
-		PathRPC  string
-		Vouchers []Session
+		Common        adminCommon
+		PathRPC       string
+		VMs           []VM
+		ProxyVouchers []Session
 	}{
-		Common:   getAdminCommon(s, r),
-		PathRPC:  PathAdminRPC,
-		Vouchers: s.vouchers.all(),
+		Common:        getAdminCommon(s, r),
+		PathRPC:       PathAdminRPC,
+		VMs:           vms,
+		ProxyVouchers: s.vouchers.all(),
 	}
 	adminIndexTmpl.Execute(w, page)
 }

@@ -55,6 +55,9 @@ func NewSandbox(ctx context.Context, cfg Config) (*Sandbox, error) {
 	case <-poststartTimeoutCtx.Done():
 		s.cancel()
 		<-s.done
+		if s.runErr != nil {
+			return nil, errors.Errorf("sandbox exited before starting: %+v", s.runErr)
+		}
 		return nil, errors.Wrap(poststartTimeoutCtx.Err(), "sandbox not started")
 	}
 	return s, nil
@@ -70,8 +73,13 @@ func (s *Sandbox) Close() error {
 	return nil
 }
 
+// Done returns a channel that is closed when the sandbox exits.
+func (s *Sandbox) Done() <-chan struct{} {
+	return s.done
+}
+
 // Exec runs a command in the sandbox.
-func (s *Sandbox) Exec(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+func (s *Sandbox) Exec(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer, attr *syscall.SysProcAttr) error {
 	// Create cmdCtx, the context runsc uses.
 	// cmdCtx waits on ctx, and upon ctx.Done cleans up gVisor processes.
 	runscExitedCtx, notifyRunscExited := context.WithCancelCause(context.Background())
@@ -84,7 +92,16 @@ func (s *Sandbox) Exec(ctx context.Context, args []string, stdin io.Reader, stdo
 	cmdCtx, cleanupDone := newCmdCtx(ctx, runscExitedCtx, s.killInternalProc, pidReader.PidChan)
 
 	// Create runsc command.
-	cmd := s.subCommand(cmdCtx, append([]string{"exec", "--internal-pid-file", pidReader.Path(), s.id}, args...)...)
+	runscArgs := s.subCommand(append([]string{"exec", "--internal-pid-file", pidReader.Path(), s.id}, args...)...)
+	if attr != nil && attr.Setctty {
+		// When the caller sets the controlling terminal, it likely
+		// means the internal gVisor process is a terminal.
+		// In this case, signals are sent to our helper processes as
+		// well as runsc. We protect our helper processes from these
+		// incoming signals, while runsc can forward them to gVisor.
+		runscArgs = append([]string{envBin, "--ignore-signal=INT,QUIT,TSTP"}, runscArgs...)
+	}
+	cmd := exec.CommandContext(cmdCtx, runscArgs[0], runscArgs[1:]...)
 	// Handle stdin ourselves, so we can return immediately when runsc exits
 	// without waiting for stdin to close.
 	var sinP io.WriteCloser
@@ -97,6 +114,7 @@ func (s *Sandbox) Exec(ctx context.Context, args []string, stdin io.Reader, stdo
 	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	cmd.SysProcAttr = attr
 	cmd.WaitDelay = time.Second
 
 	// Start runsc and wait.
@@ -139,17 +157,17 @@ func (s *Sandbox) Exec(ctx context.Context, args []string, stdin io.Reader, stdo
 }
 
 // subCommand returns a command that runs runsc in the sandbox's user and PID namespaces.
-func (s *Sandbox) subCommand(ctx context.Context, args ...string) *exec.Cmd {
+func (s *Sandbox) subCommand(args ...string) []string {
 	nsArgs := []string{
-		"-t", strconv.Itoa(s.runscPid), "--user", "--pid", "--preserve-credentials",
+		nsenterBin, "-t", strconv.Itoa(s.runscPid), "--user", "--pid", "--preserve-credentials",
 		setprivBin, "--pdeathsig", "KILL", "--",
 		runscBin, "--root", s.state}
-	cmd := exec.CommandContext(ctx, nsenterBin, append(nsArgs, args...)...)
-	return cmd
+	return append(nsArgs, args...)
 }
 
 func (s *Sandbox) killInternalProc(ctx context.Context, pid int, sig string) error {
-	if out, err := s.subCommand(ctx, "kill", "--pid", strconv.Itoa(pid), s.id, sig).CombinedOutput(); err != nil {
+	args := s.subCommand("kill", "--pid", strconv.Itoa(pid), s.id, sig)
+	if out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput(); err != nil {
 		return errors.Wrapf(err, "runsc kill %s: %s", sig, out)
 	}
 	return nil

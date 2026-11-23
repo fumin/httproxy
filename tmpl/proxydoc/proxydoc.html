@@ -12,7 +12,10 @@ img { max-width: 100%; }
 	</style>
 </head>
 <body>
+{{template "navbar" .Common.Navbar}}
+
 {{.Body}}
+
 <script>
 // Text to copy from a code block: everything before the "# Output:" comment, if any.
 function commandText(code) {

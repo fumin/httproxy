@@ -56,8 +56,8 @@ const (
 	innerNsFd = 4
 
 	// Binaries used.
-	pastaBin   = "/usr/bin/pasta"
-	runscBin   = "/usr/bin/runsc"
+	pastaBin   = "pasta"
+	runscBin   = "runsc"
 	ipBin      = "/usr/bin/ip"
 	unshareBin = "/usr/bin/unshare"
 	nsenterBin = "/usr/bin/nsenter"
@@ -66,6 +66,7 @@ const (
 	setprivBin = "/usr/bin/setpriv"
 	mountBin   = "/usr/bin/mount"
 	shBin      = "/bin/sh"
+	envBin     = "/usr/bin/env"
 )
 
 // Config configures a sandbox.
@@ -73,8 +74,6 @@ type Config struct {
 	// Root is a host directory used as the sandbox's root filesystem.
 	Root string
 	// Mounts are mounted on top of Root.
-	// Destinations, with symlinks resolved inside Root, must already exist
-	// otherwise runsc will try to create it inside the read-only Root, and fail to start.
 	Mounts []specs.Mount
 	// Blocked are destination ranges the sandbox cannot connect to.
 	Blocked []string
@@ -95,23 +94,28 @@ type Config struct {
 }
 
 // DefaultConfig returns a default Config.
-func DefaultConfig() Config {
+func DefaultConfig(root string) Config {
+	entries, err := os.ReadDir(filepath.Join(root, "home"))
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	username := entries[0].Name()
+
 	return Config{
-		Root: "/home/ubuntu/fcvm/unwanted/squashfs-root",
+		Root: root,
 		Mounts: []specs.Mount{
-			{Destination: "/etc/resolv.conf", Type: "bind", Source: "/home/ubuntu/fcvm/unwanted/mount/resolv.conf", Options: []string{"ro", "bind"}},
-			{Destination: "/home/ubuntu", Type: "tmpfs", Source: "tmpfs", Options: []string{"mode=0750", "uid=1000", "gid=1000"}},
+			{Destination: "/home/" + username, Type: "tmpfs", Source: "tmpfs", Options: []string{"mode=0750", "uid=1000", "gid=1000"}},
 			{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"mode=1777"}},
 		},
 		// Local area networks.
 		Blocked: []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16", "fc00::/7", "fe80::/10"},
 
-		MemoryMax: 512 << 20,
-		CPUQuota:  100,
+		MemoryMax: 64 << 20,
+		CPUQuota:  200,
 		TasksMax:  256,
 
 		User: specs.User{UID: 1000, GID: 1000},
-		Cwd:  "/home/ubuntu",
+		Cwd:  "/home/" + username,
 		Env: []string{
 			"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 			"TERM=xterm-256color",
@@ -130,6 +134,9 @@ func run(ctx context.Context, cfg Config, started func(id, state string, runscPi
 		return errors.Wrap(err, "")
 	}
 	defer os.RemoveAll(dir)
+	if err := addNeededMounts(&cfg, dir); err != nil {
+		return errors.Wrap(err, "")
+	}
 
 	// Create the listener that will be notified when runsc has started.
 	poststart, err := newPoststartListener(dir)
@@ -147,7 +154,7 @@ func run(ctx context.Context, cfg Config, started func(id, state string, runscPi
 	if err != nil {
 		return errors.Wrap(err, "")
 	}
-	rootMountArgs := makeRootMountArgs(cfg.Root, filepath.Join(dir, "bundle", "rootfs"), pastaArgs)
+	rootMountArgs := makeRootMountArgs(cfg.Root, bundleRoot(dir), pastaArgs)
 
 	// Create cmd so that the entire process tree is killed once we exit.
 	// This is done by setting Pdeathsig which kills our direct child.
@@ -408,17 +415,17 @@ func makeRunscArgs(id, dir, poststartSock string, cfg Config) ([]string, error) 
 	// runsc's container state, which is not part of the bundle.
 	state := filepath.Join(dir, "state")
 
-	if err := os.MkdirAll(filepath.Join(bundle, "rootfs"), 0755); err != nil {
-		return nil, errors.Wrap(err, "")
-	}
 	if err := writeSpec(bundle, newSpec(cfg, poststartSock)); err != nil {
 		return nil, errors.Wrap(err, "")
 	}
 
 	runscArgs := []string{runscBin,
-		"--network=sandbox",
 		"--root", state,
-		"--overlay2", "root:memory",
+		// Writes to the root filesystem and bind mounts go to memory, never to the host.
+		"--overlay2", "all:memory",
+		// Honor SUID/SGID bits, so that su can switch to root.
+		"--allow-suid",
+		"--network=sandbox",
 		// Without root, runsc cannot create cgroups.
 		"--ignore-cgroups",
 		"run", "--bundle", bundle, id}
@@ -451,11 +458,13 @@ func newSpec(cfg Config, poststartSock string) *specs.Spec {
 	return &specs.Spec{
 		Version: specs.Version,
 		Process: &specs.Process{
-			Args:            []string{sleepBin, "infinity"},
-			User:            cfg.User,
-			Env:             cfg.Env,
-			Cwd:             cfg.Cwd,
-			NoNewPrivileges: true,
+			Args: []string{sleepBin, "infinity"},
+			User: cfg.User,
+			Env:  cfg.Env,
+			Cwd:  cfg.Cwd,
+			// The capabilities su needs, to set the IDs and groups of root.
+			// Only the bounding set, so that processes have none until su runs.
+			Capabilities: &specs.LinuxCapabilities{Bounding: []string{"CAP_SETUID", "CAP_SETGID"}},
 		},
 		Root:     &specs.Root{Path: "rootfs"},
 		Hostname: "sandbox",
@@ -476,4 +485,26 @@ func writeSpec(bundle string, s *specs.Spec) error {
 		return errors.Wrap(err, "")
 	}
 	return nil
+}
+
+func addNeededMounts(cfg *Config, dir string) error {
+	if err := os.MkdirAll(bundleRoot(dir), 0755); err != nil {
+		return errors.Wrap(err, "")
+	}
+	mounts := filepath.Join(dir, "mounts")
+	if err := os.MkdirAll(mounts, 0755); err != nil {
+		return errors.Wrap(err, "")
+	}
+
+	resolv := filepath.Join(mounts, "resolv.conf")
+	if err := os.WriteFile(resolv, []byte("nameserver 1.1.1.1\nnameserver 8.8.8.8\n"), 0644); err != nil {
+		return errors.Wrap(err, "")
+	}
+	cfg.Mounts = append(cfg.Mounts, specs.Mount{Destination: "/etc/resolv.conf", Type: "bind", Source: resolv, Options: []string{"bind"}})
+
+	return nil
+}
+
+func bundleRoot(dir string) string {
+	return filepath.Join(dir, "bundle", "rootfs")
 }

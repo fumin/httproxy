@@ -18,3 +18,12 @@ type Session struct {
 	Usage      int64
 	CreateAt   time.Time `json:",omitzero"`
 }
+
+type VM struct {
+	ID         string
+	UsageLimit int
+	Usage      int
+	CreateAt   time.Time `json:",omitzero"`
+
+	Running bool
+}

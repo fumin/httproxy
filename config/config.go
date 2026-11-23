@@ -3,16 +3,14 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/fumin/httproxy/util"
 	"github.com/pkg/errors"
 )
 
-// DevRoot is the data directory in development.
-const DevRoot = "data"
-
 type Secret struct {
-	Password string
+	Password util.Secret[string]
 }
 
 type Config struct {
@@ -23,7 +21,10 @@ type Config struct {
 	DB   string
 	XMR  string
 
-	DetailError bool
+	VMRoot             string
+	VMRam              uint64
+	VMMaxNum           int
+	VMUsageGranularity time.Duration
 }
 
 func Prod() (Config, error) {
@@ -38,28 +39,36 @@ func Prod() (Config, error) {
 		return Config{}, errors.Wrap(err, "")
 	}
 	cfg := Config{
-		Secret: secret,
-		Addr:   ":28877",
-		Root:   filepath.Join(projDir, "data"),
-		XMR:    "127.0.0.1:28088",
+		Secret:             secret,
+		Addr:               ":28877",
+		Root:               filepath.Join(projDir, "data"),
+		XMR:                "127.0.0.1:28088",
+		VMRam:              1024 << 20,
+		VMMaxNum:           2,
+		VMUsageGranularity: time.Hour,
 	}
 	cfg.DB = filepath.Join(cfg.Root, "sqlite.db")
+	cfg.VMRoot = filepath.Join(cfg.Root, "ubuntu-24.04")
 	return cfg, nil
 }
 
 func Dev() (Config, error) {
-	secret, err := readSecret("./secret")
+	const root = "../data"
+	secret, err := readSecret(filepath.Join(root, "secret"))
 	if err != nil {
 		return Config{}, errors.Wrap(err, "")
 	}
 	cfg := Config{
-		Secret:      secret,
-		Addr:        ":28877",
-		Root:        DevRoot,
-		XMR:         "127.0.0.1:28088",
-		DetailError: true,
+		Secret:             secret,
+		Addr:               ":28877",
+		Root:               root,
+		XMR:                "127.0.0.1:28088",
+		VMRam:              64 << 20,
+		VMMaxNum:           2,
+		VMUsageGranularity: time.Hour,
 	}
 	cfg.DB = filepath.Join(cfg.Root, "sqlite.db")
+	cfg.VMRoot = filepath.Join(cfg.Root, "ubuntu-24.04")
 	return cfg, nil
 }
 

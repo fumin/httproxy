@@ -15,7 +15,7 @@ import (
 	"github.com/fumin/httproxy/api"
 	"github.com/fumin/httproxy/auth"
 	"github.com/fumin/httproxy/config"
-	"github.com/fumin/httproxy/util"
+	"github.com/fumin/httproxy/util/gvisor"
 	"github.com/fumin/httproxy/util/jsonrpc"
 	"github.com/fumin/httproxy/util/monero"
 	"github.com/pkg/errors"
@@ -25,19 +25,40 @@ import (
 	"github.com/yuin/goldmark/parser"
 )
 
+const (
+	serviceProxy = "p"
+	serviceVM    = "v"
+
+	cookieNameVMID = "vmid"
+
+	PathVMSetID     = "/VMSetID"
+	PathVMLoginPage = "/VMLoginPage"
+	PathVMLogin     = "/VMLogin"
+	PathVMDoc       = "/VMDoc"
+	PathProxyDoc    = "/ProxyDoc"
+)
+
 const schema = `
-CREATE TABLE IF NOT EXISTS session (
+CREATE TABLE IF NOT EXISTS payment (
+	method TEXT NOT NULL,
+	tx TEXT NOT NULL,
+	service TEXT NOT NULL,
+	serviceID TEXT NOT NULL,
+	PRIMARY KEY (method, tx)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS proxy_session (
 	id TEXT PRIMARY KEY,
 	usageLimit INTEGER NOT NULL,
 	usage INTEGER NOT NULL,
 	createAt INTEGER NOT NULL
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS payment (
-	method TEXT NOT NULL,
-	tx TEXT NOT NULL,
-	session TEXT NOT NULL,
-	PRIMARY KEY (method, tx)
+CREATE TABLE IF NOT EXISTS vm (
+	id TEXT PRIMARY KEY,
+	usageLimit INTEGER NOT NULL,
+	usage INTEGER NOT NULL,
+	createAt INTEGER NOT NULL
 ) STRICT;
 `
 
@@ -51,14 +72,15 @@ type Server struct {
 	XMR     *monero.Wallet
 	XMRAddr string
 
-	auth     *auth.Authorizer
-	vouchers *voucherDealer
+	auth      *auth.Authorizer
+	vouchers  *voucherDealer
+	vmService *vmService
 
 	ServeMux *http.ServeMux
 	Server   http.Server
 }
 
-func NewServer(cfg config.Config) (*Server, error) {
+func NewServer(ctx context.Context, cfg config.Config) (*Server, error) {
 	s := &Server{C: cfg}
 
 	// Setup data folder.
@@ -70,20 +92,7 @@ func NewServer(cfg config.Config) (*Server, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
-	// Setup database.
-	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
-		return sqlite.ExecScript(conn.(sqlite.SQLConn), "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-	}
-	s.DB = sql.OpenDB(sqlite.Connector(s.C.DB, connInitFunc, nil))
-	if err := s.DB.Ping(); err != nil {
-		return nil, errors.Wrap(err, "")
-	}
-	conn, err := s.DB.Conn(context.Background())
-	if err != nil {
-		return nil, errors.Wrap(err, "")
-	}
-	err = sqlite.ExecScript(conn, schema)
-	conn.Close()
+	s.DB, err = openDB(ctx, s.C.DB)
 	if err != nil {
 		return nil, errors.Wrap(err, "")
 	}
@@ -94,9 +103,17 @@ func NewServer(cfg config.Config) (*Server, error) {
 		return nil, errors.Wrap(err, "")
 	}
 	s.XMRAddr = addrOut.Address
+
 	// Miscellaneous.
 	s.auth = auth.NewAuthorizer()
 	s.vouchers = newVoucherDealer()
+	vmCfg := gvisor.DefaultConfig(s.C.VMRoot)
+	vmCfg.MemoryMax = s.C.VMRam
+	s.vmService, err = newVMService(ctx, s.DB, s.C.VMMaxNum, vmCfg, s.C.VMUsageGranularity)
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+
 	// Setup HTTP server.
 	s.ServeMux = http.NewServeMux()
 	s.Server.Addr = s.C.Addr
@@ -117,16 +134,24 @@ func NewServer(cfg config.Config) (*Server, error) {
 	handleAdmin(s)
 	s.ServeMux.Handle("/static/", http.FileServer(http.FS(staticFS)))
 	methods := map[string]jsonrpc.MethodParams{
-		"topup": m(s, topup, api.TopupIn{}),
-		"usage": m(s, usage, api.UsageIn{}),
+		"ProxyTopup": m(s, ProxyTopup, api.ProxyTopupIn{}),
+		"ProxyUsage": m(s, ProxyUsage, api.ProxyUsageIn{}),
+		"VMTopup":    m(s, VMTopup, api.VMTopupIn{}),
+		"VMInfo":     m(s, VMInfo, api.VMInfoIn{}),
 	}
 	s.ServeMux.HandleFunc("/json_rpc", jsonrpc.NewHandler(methods, nil))
+	handleFunc(s, PathVMSetID, VMSetID)
+	handleFunc(s, PathVMLoginPage, VMLoginPage)
+	handleFunc(s, PathVMLogin, VMLogin)
+	handleFunc(s, PathVMDoc, VMDoc)
+	handleFunc(s, PathProxyDoc, ProxyDoc)
 	handleFunc(s, "/{$}", Index)
 
 	return s, nil
 }
 
 func (s *Server) Close() error {
+	s.vmService.Close()
 	s.vouchers.Close()
 	s.DB.Close()
 	return nil
@@ -139,14 +164,11 @@ func handleFunc(s *Server, httpPath string, fn func(*Server, http.ResponseWriter
 	s.ServeMux.HandleFunc(httpPath, handler)
 }
 
-func m[Params, Result any](s *Server, method func(s *Server, params Params) (Result, error), paramsTmpl Params) jsonrpc.MethodParams {
-	m := func(params any) (any, error) {
-		result, err := method(s, params.(Params))
+func m[Params, Result any](s *Server, method func(ctx context.Context, s *Server, params Params) (Result, error), paramsTmpl Params) jsonrpc.MethodParams {
+	m := func(ctx context.Context, params any) (any, error) {
+		result, err := method(ctx, s, params.(Params))
 		if err != nil {
-			if s.C.DetailError {
-				return nil, errors.Errorf("%+v", err)
-			}
-			return nil, err
+			return nil, errors.Errorf("%+v", err)
 		}
 		return result, nil
 	}
@@ -165,73 +187,61 @@ func mustRenderMarkdown(src []byte) template.HTML {
 	return template.HTML(buf.String())
 }
 
-//go:embed tmpl/index/index.html
-var indexHTML string
-var indexTmpl = template.Must(template.New("").Parse(indexHTML))
+func openDB(ctx context.Context, sqliteURI string) (*sql.DB, error) {
+	connInitFunc := func(ctx context.Context, conn driver.ConnPrepareContext) error {
+		return sqlite.ExecScript(conn.(sqlite.SQLConn), `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA encoding="UTF-8";`)
+	}
+	db := sql.OpenDB(sqlite.Connector(sqliteURI, connInitFunc, nil))
+	if err := db.Ping(); err != nil {
+		return nil, errors.Wrap(err, "")
+	}
 
-//go:embed tmpl/index/index.md
-var indexMD []byte
-var indexBody = mustRenderMarkdown(indexMD)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+	defer conn.Close()
+	err = sqlite.ExecScript(conn, schema)
+	if err != nil {
+		return nil, errors.Wrap(err, "")
+	}
+
+	return db, nil
+}
+
+//go:embed tmpl/navbar.html
+var navbarHTML string
+var navbarTmpl = template.Must(template.New("").Parse(navbarHTML))
+
+func commonTmpl() *template.Template {
+	return template.Must(navbarTmpl.Clone())
+}
+
+type pageCommon struct {
+	Navbar struct {
+		PathIndex string
+	}
+}
+
+func getPageCommon(s *Server, r *http.Request) pageCommon {
+	c := pageCommon{}
+	c.Navbar.PathIndex = "/"
+	return c
+}
+
+//go:embed tmpl/index.html
+var indexHTML string
+var indexTmpl = template.Must(commonTmpl().Parse(indexHTML))
 
 func Index(s *Server, w http.ResponseWriter, r *http.Request) {
 	page := struct {
-		Body template.HTML
+		Common   pageCommon
+		VMDoc    string
+		ProxyDoc string
 	}{
-		Body: indexBody,
+		Common:   getPageCommon(s, r),
+		VMDoc:    PathVMDoc,
+		ProxyDoc: PathProxyDoc,
 	}
 	indexTmpl.Execute(w, page)
-}
-
-func topup(s *Server, in api.TopupIn) (out Session, err error) {
-	received, err := xmrReceived(s.XMR, s.XMRAddr, in.PaymentTx)
-	if err != nil {
-		return out, errors.Wrap(err, "")
-	}
-	usageLimit := received / api.ProxyPriceXMRPicoPerByte
-
-	newSession := false
-	sessionID := in.SessionID
-	if sessionID == "" {
-		newSession = true
-		sessionID = util.RandStr()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	tx, err := s.DB.BeginTx(ctx, nil)
-	if err != nil {
-		return out, errors.Wrap(err, "")
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(ctx, "INSERT INTO payment (method, tx, session) VALUES (?, ?, ?)", in.Method, in.PaymentTx, sessionID); err != nil {
-		return out, errors.Wrap(err, "")
-	}
-	if newSession {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO session (id, usageLimit, usage, createAt) VALUES (?, ?, ?, ?)", sessionID, usageLimit, 0, time.Now().Unix()); err != nil {
-			return out, errors.Wrap(err, "")
-		}
-	} else {
-		if _, err := tx.ExecContext(ctx, "UPDATE session SET usageLimit=usageLimit+? WHERE id=?", usageLimit, sessionID); err != nil {
-			return out, errors.Wrap(err, "")
-		}
-	}
-	if err := tx.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", sessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
-		return out, errors.Wrap(err, "")
-	}
-
-	if err := tx.Commit(); err != nil {
-		return out, errors.Wrap(err, "")
-	}
-
-	return
-}
-
-func usage(s *Server, in api.UsageIn) (out Session, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := s.DB.QueryRowContext(ctx, "SELECT id, usageLimit, usage FROM session WHERE id=?", in.SessionID).Scan(&out.ID, &out.UsageLimit, &out.Usage); err != nil {
-		return out, errors.Wrap(err, "")
-	}
-	return
 }

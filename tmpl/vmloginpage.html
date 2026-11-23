@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>VPS Terminal</title>
+	<link rel="stylesheet" href="/static/xterm/xterm.css">
+	<style>
+html, body { height: 100%; margin: 0; background: #000; }
+body { display: flex; flex-direction: column; }
+#terminal { flex: 1; min-height: 0; padding: 4px; box-sizing: border-box; }
+#status { display: none; padding: 0.4em 0.8em; color: #ddd; background: #222; font: 14px sans-serif; }
+#status.shown { display: block; }
+	</style>
+</head>
+<body>
+<div id="terminal"></div>
+<div id="status"><span></span> <button type="button">Reconnect</button></div>
+
+<script src="/static/xterm/xterm.js"></script>
+<script src="/static/xterm/addon-fit.js"></script>
+<script>
+// The Kubernetes remote command protocol, versions 5 and 4.
+// Every message is binary, and starts with a byte that is its channel.
+const protocols = ["v5.channel.k8s.io", "v4.channel.k8s.io"];
+const chStdin = 0, chStdout = 1, chStderr = 2, chError = 3, chResize = 4;
+
+const term = new Terminal({cursorBlink: true, scrollback: 10000});
+const fit = new FitAddon.FitAddon();
+term.loadAddon(fit);
+term.open(document.getElementById("terminal"));
+fit.fit();
+window.addEventListener("resize", () => fit.fit());
+
+const statusBar = document.getElementById("status");
+statusBar.querySelector("button").addEventListener("click", () => {
+	statusBar.classList.remove("shown");
+	term.reset();
+	connect();
+});
+
+let ws = null;
+const encoder = new TextEncoder();
+
+// send sends data, a string or bytes, on channel ch.
+function send(ch, data) {
+	if (!ws || ws.readyState !== WebSocket.OPEN) {
+		return;
+	}
+	let bytes = typeof data === "string" ? encoder.encode(data) : data;
+	let msg = new Uint8Array(1 + bytes.length);
+	msg[0] = ch;
+	msg.set(bytes, 1);
+	ws.send(msg);
+}
+
+function sendSize() {
+	send(chResize, JSON.stringify({Width: term.cols, Height: term.rows}));
+}
+
+term.onData(data => send(chStdin, data));
+// Binary data, such as some mouse reports, is a string of byte values.
+term.onBinary(data => send(chStdin, Uint8Array.from(data, c => c.charCodeAt(0))));
+term.onResize(sendSize);
+
+// statusMessage returns a description of a Kubernetes Status object.
+function statusMessage(bytes) {
+	try {
+		let s = JSON.parse(new TextDecoder().decode(bytes));
+		if (s.status === "Success") {
+			return "Shell exited.";
+		}
+		return s.message || "Shell failed.";
+	} catch (e) {
+		return "Invalid status: " + e.message;
+	}
+}
+
+function showStatus(text) {
+	statusBar.querySelector("span").textContent = text;
+	statusBar.classList.add("shown");
+	fit.fit();
+}
+
+function connect() {
+  let pathVMLogin = {{.PathVMLogin}};
+	let scheme = location.protocol === "https:" ? "wss:" : "ws:";
+	let params = new URLSearchParams({id: new URLSearchParams(location.search).get("id") ?? ""});
+	let sock = new WebSocket(`${scheme}//${location.host}${pathVMLogin}?${params}`, protocols);
+	sock.binaryType = "arraybuffer";
+	ws = sock;
+	let exitMessage = "";
+
+	sock.addEventListener("open", () => {
+		sendSize();
+		term.focus();
+	});
+	sock.addEventListener("message", ev => {
+		if (!(ev.data instanceof ArrayBuffer) || ev.data.byteLength === 0) {
+			return;
+		}
+		let msg = new Uint8Array(ev.data);
+		let data = msg.subarray(1);
+		switch (msg[0]) {
+		case chStdout:
+		case chStderr:
+			term.write(data);
+			break;
+		case chError:
+			exitMessage = statusMessage(data);
+			break;
+		}
+	});
+	sock.addEventListener("close", ev => {
+		if (ws !== sock) {
+			return;
+		}
+		ws = null;
+		let text = exitMessage || `Disconnected (code ${ev.code}${ev.reason ? ": " + ev.reason : ""}).`;
+		showStatus(text);
+	});
+}
+
+connect();
+</script>
+</body>
+</html>

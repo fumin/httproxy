@@ -2,6 +2,8 @@ package httproxy
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"encoding/base64"
 	"flag"
 	"fmt"
@@ -18,11 +20,12 @@ import (
 	"github.com/fumin/httproxy/api"
 	"github.com/fumin/httproxy/config"
 	"github.com/fumin/httproxy/config/backendconfig"
+	"github.com/fumin/httproxy/util"
 	"github.com/fumin/httproxy/util/monero"
 )
 
-func TestTopup(t *testing.T) {
-	b := newBackend(t)
+func TestProxyTopup(t *testing.T) {
+	b := newBackend(t, nil)
 	t.Cleanup(b.Close)
 
 	// Send money.
@@ -31,14 +34,14 @@ func TestTopup(t *testing.T) {
 	txid := transfer(b.s.XMR, b.xmr, amount, b.xmrNode)
 
 	// Top up.
-	topupIn := api.TopupIn{Method: api.MethodXMR, PaymentTx: txid}
-	topupOut, err := b.c.Topup(topupIn)
+	topupIn := api.ProxyTopupIn{Method: api.MethodXMR, PaymentTx: txid}
+	topupOut, err := b.c.ProxyTopup(topupIn)
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
 
 	// Check usage limit.
-	usageOut0, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	usageOut0, err := b.c.ProxyUsage(api.ProxyUsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -50,7 +53,7 @@ func TestTopup(t *testing.T) {
 	if err := useProxy(b.hs.Listener.Addr().String(), topupOut.ID); err != nil {
 		t.Fatalf("%+v", err)
 	}
-	usageOut1, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	usageOut1, err := b.c.ProxyUsage(api.ProxyUsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -62,7 +65,7 @@ func TestTopup(t *testing.T) {
 	if err := useHTTPProxy(b.hs.Listener.Addr().String(), topupOut.ID); err != nil {
 		t.Fatalf("%+v", err)
 	}
-	usageOut2, err := b.c.Usage(api.UsageIn{SessionID: topupOut.ID})
+	usageOut2, err := b.c.ProxyUsage(api.ProxyUsageIn{SessionID: topupOut.ID})
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -89,23 +92,41 @@ type backend struct {
 	c  *api.Client
 }
 
-func newBackend(t *testing.T) *backend {
+func newBackend(t *testing.T, fixtures func(context.Context, *sql.DB) error) *backend {
 	backendCfg := backendconfig.Default
+	devCfg, err := config.Dev()
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
 
 	// Setup server.
 	b := &backend{}
 	cfg := config.Config{
 		Secret: config.Secret{
-			Password: "x",
+			Password: util.NewSecret("x"),
 		},
-		Addr:        ":0",
-		Root:        t.TempDir(),
-		DB:          fmt.Sprintf("file:/%s?vfs=memdb", t.Name()),
-		XMR:         backendCfg.TestXMR0,
-		DetailError: true,
+		Addr:               ":0",
+		Root:               t.TempDir(),
+		DB:                 fmt.Sprintf("file:/%s?vfs=memdb", t.Name()),
+		XMR:                backendCfg.TestXMR0,
+		VMRoot:             devCfg.VMRoot,
+		VMRam:              64 << 20,
+		VMMaxNum:           2,
+		VMUsageGranularity: 100 * time.Millisecond,
 	}
-	var err error
-	b.s, err = NewServer(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := openDB(ctx, cfg.DB)
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	defer db.Close()
+	if fixtures != nil {
+		if err = fixtures(ctx, db); err != nil {
+			panic(fmt.Sprintf("%+v", err))
+		}
+	}
+	b.s, err = NewServer(ctx, cfg)
 	if err != nil {
 		panic(fmt.Sprintf("%+v", err))
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -24,7 +25,7 @@ func TestSandbox(t *testing.T) {
 	defer cancel()
 
 	// Create sandbox and terminals.
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -60,7 +61,7 @@ func TestSandbox(t *testing.T) {
 func TestSandboxCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -90,7 +91,7 @@ func TestSandboxCancel(t *testing.T) {
 func TestSandboxRoot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	cfg := DefaultConfig()
+	cfg := defaultConfig()
 	// Run as root, so that anywhere in Root can be written.
 	cfg.User = specs.User{}
 	s, err := NewSandbox(ctx, cfg)
@@ -108,7 +109,7 @@ func TestSandboxRoot(t *testing.T) {
 	}
 	for path, want := range want {
 		var stdout, stderr strings.Builder
-		if err := s.Exec(ctx, []string{"cat", path}, nil, &stdout, &stderr); err != nil {
+		if err := s.Exec(ctx, []string{"cat", path}, nil, &stdout, &stderr, nil); err != nil {
 			t.Fatalf("%+v %q", err, stderr.String())
 		}
 		if got := stdout.String(); got != want {
@@ -118,7 +119,7 @@ func TestSandboxRoot(t *testing.T) {
 
 	// Writes inside the sandbox do not reach Root on the host.
 	name := "gvisor-test-" + strconv.Itoa(os.Getpid())
-	if err := s.Exec(ctx, []string{"touch", "/" + name}, nil, io.Discard, io.Discard); err != nil {
+	if err := s.Exec(ctx, []string{"touch", "/" + name}, nil, io.Discard, io.Discard, nil); err != nil {
 		t.Fatalf("%+v", err)
 	}
 	if _, err := os.Lstat(filepath.Join(cfg.Root, name)); !errors.Is(err, os.ErrNotExist) {
@@ -129,7 +130,7 @@ func TestSandboxRoot(t *testing.T) {
 func TestSandboxExecBash(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -146,7 +147,7 @@ func TestSandboxExecBash(t *testing.T) {
 	}
 	for _, test := range tests {
 		var stdout, stderr strings.Builder
-		if err := s.Exec(ctx, test.args, nil, &stdout, &stderr); err != nil {
+		if err := s.Exec(ctx, test.args, nil, &stdout, &stderr, nil); err != nil {
 			t.Fatalf("%+v %q", err, stderr.String())
 		}
 		if got := stdout.String(); got != test.want {
@@ -155,7 +156,7 @@ func TestSandboxExecBash(t *testing.T) {
 	}
 
 	// A failing command returns its exit status.
-	err = s.Exec(ctx, []string{"/bin/sh", "-c", "exit 3"}, nil, io.Discard, io.Discard)
+	err = s.Exec(ctx, []string{"/bin/sh", "-c", "exit 3"}, nil, io.Discard, io.Discard, nil)
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
 		t.Errorf("got %+v, want exit status 3", err)
@@ -165,7 +166,7 @@ func TestSandboxExecBash(t *testing.T) {
 func TestSandboxExecCancelEarly(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -177,7 +178,7 @@ func TestSandboxExecCancelEarly(t *testing.T) {
 			// execCtx timeout almost immediately.
 			execCtx, execCancel := context.WithTimeout(ctx, time.Duration(d)*time.Millisecond)
 			defer execCancel()
-			return s.Exec(execCtx, []string{"sleep", strconv.Itoa(1000 + i)}, nil, io.Discard, io.Discard)
+			return s.Exec(execCtx, []string{"sleep", strconv.Itoa(1000 + i)}, nil, io.Discard, io.Discard, nil)
 		}()
 
 		// Check that we got an error, and we did not hang.
@@ -196,7 +197,7 @@ func TestSandboxExecCancelEarly(t *testing.T) {
 func TestSandboxExecCancelKill(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -209,7 +210,7 @@ func TestSandboxExecCancelKill(t *testing.T) {
 	err = func() error {
 		execCtx, execCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		defer execCancel()
-		return s.Exec(execCtx, []string{"/bin/sh", "-c", script}, nil, io.Discard, io.Discard)
+		return s.Exec(execCtx, []string{"/bin/sh", "-c", script}, nil, io.Discard, io.Discard, nil)
 	}()
 	// Check that we got an error, and we did not hang.
 	if err == nil {
@@ -232,7 +233,7 @@ func TestSandboxExecCancelKill(t *testing.T) {
 func TestSandboxExecRunscKilled(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s, err := NewSandbox(ctx, DefaultConfig())
+	s, err := NewSandbox(ctx, defaultConfig())
 	if err != nil {
 		t.Fatalf("%+v", err)
 	}
@@ -240,7 +241,7 @@ func TestSandboxExecRunscKilled(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- s.Exec(ctx, []string{"sleep", "4001"}, nil, io.Discard, io.Discard)
+		done <- s.Exec(ctx, []string{"sleep", "4001"}, nil, io.Discard, io.Discard, nil)
 	}()
 
 	// Get the host pid of runsc, and the sandbox pid of sleep.
@@ -249,7 +250,7 @@ func TestSandboxExecRunscKilled(t *testing.T) {
 		out, _ := exec.Command("pgrep", "-n", "-f", "^"+runscBin+" .* sleep 4001$").Output()
 		runscPid, _ = strconv.Atoi(strings.TrimSpace(string(out)))
 		var sout strings.Builder
-		s.Exec(ctx, []string{"pgrep", "-x", "-f", "sleep 4001"}, nil, &sout, io.Discard)
+		s.Exec(ctx, []string{"pgrep", "-x", "-f", "sleep 4001"}, nil, &sout, io.Discard, nil)
 		sleepPid, _ = strconv.Atoi(strings.TrimSpace(sout.String()))
 		time.Sleep(200 * time.Millisecond)
 	}
@@ -272,7 +273,7 @@ func TestSandboxExecRunscKilled(t *testing.T) {
 
 	// Check that process inside gVisor is killed as well.
 	var out strings.Builder
-	s.Exec(ctx, []string{"ps", "-o", "args=", "-p", strconv.Itoa(sleepPid)}, nil, &out, &out)
+	s.Exec(ctx, []string{"ps", "-o", "args=", "-p", strconv.Itoa(sleepPid)}, nil, &out, &out, nil)
 	if p := strings.TrimSpace(out.String()); p != "" {
 		t.Errorf("command still running after runsc was killed: pid %d: %s", sleepPid, p)
 	}
@@ -283,6 +284,14 @@ func TestMain(m *testing.M) {
 	log.SetFlags(log.Lmicroseconds | log.Llongfile | log.LstdFlags)
 
 	m.Run()
+}
+
+func defaultConfig() Config {
+	root, err := filepath.Abs(filepath.Join("..", "..", "..", "data", "ubuntu-24.04"))
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	return DefaultConfig(root)
 }
 
 type terminal struct {
@@ -296,7 +305,7 @@ func execTerminal(ctx context.Context, s *Sandbox) *terminal {
 	stdinR, stdinW := io.Pipe()
 	t := &terminal{stdin: stdinW, done: make(chan error, 1)}
 	go func() {
-		t.done <- s.Exec(ctx, []string{"/bin/bash"}, stdinR, &t.stdout, &t.stderr)
+		t.done <- s.Exec(ctx, []string{"/bin/bash"}, stdinR, &t.stdout, &t.stderr, nil)
 	}()
 	return t
 }
@@ -310,7 +319,7 @@ func (t *terminal) Close() error {
 func sandboxProcs(ctx context.Context, t *testing.T, s *Sandbox) string {
 	t.Helper()
 	var out strings.Builder
-	if err := s.Exec(ctx, []string{"ps", "-eo", "args"}, nil, &out, &out); err != nil {
+	if err := s.Exec(ctx, []string{"ps", "-eo", "args"}, nil, &out, &out, nil); err != nil {
 		t.Fatalf("%+v %s", err, out.String())
 	}
 	return out.String()

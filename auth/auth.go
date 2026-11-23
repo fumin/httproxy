@@ -62,10 +62,11 @@ func (a *Authorizer) RotateToken() {
 }
 
 func (a *Authorizer) Check(w http.ResponseWriter, r *http.Request) bool {
-	if ok := a.checkBearer(r); ok {
-		return true
-	}
-	if ok := a.checkCookie(r); ok {
+	reqToken := GetToken(r, cookieNameAuthentication)
+	a.RLock()
+	ok := subtle.ConstantTimeCompare([]byte(reqToken), []byte(a.token)) == 1
+	a.RUnlock()
+	if ok {
 		return true
 	}
 
@@ -79,7 +80,12 @@ func (a *Authorizer) LoggedIn(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return a.checkToken(cookie.Value)
+	reqToken := []byte(cookie.Value)
+
+	a.RLock()
+	ok := (subtle.ConstantTimeCompare(reqToken, []byte(a.token)) == 1)
+	a.RUnlock()
+	return ok
 }
 
 func (a *Authorizer) Token() string {
@@ -89,38 +95,37 @@ func (a *Authorizer) Token() string {
 	return token
 }
 
-func (a *Authorizer) checkBearer(r *http.Request) bool {
-	auth := r.Header.Get("Authorization")
-	if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
-		return false
+func GetToken(r *http.Request, cookieName string) string {
+	if token := fromBearer(r); token != "" {
+		return token
 	}
-	token := auth[len(bearerPrefix):]
-
-	return a.checkToken(token)
+	if token := fromCookie(r, cookieName); token != "" {
+		return token
+	}
+	return ""
 }
 
-func (a *Authorizer) checkCookie(r *http.Request) bool {
+func fromBearer(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if len(auth) < len(bearerPrefix) || auth[:len(bearerPrefix)] != bearerPrefix {
+		return ""
+	}
+	return auth[len(bearerPrefix):]
+}
+
+func fromCookie(r *http.Request, cookieName string) string {
 	// Defend against cross-site-request-forgery.
 	origin, err := url.Parse(r.Header.Get("Origin"))
 	if err != nil {
-		return false
+		return ""
 	}
 	if origin.Host != r.Host {
-		return false
+		return ""
 	}
 
-	cookie, err := r.Cookie(cookieNameAuthentication)
+	cookie, err := r.Cookie(cookieName)
 	if err != nil {
-		return false
+		return ""
 	}
-	token := cookie.Value
-
-	return a.checkToken(token)
-}
-
-func (a *Authorizer) checkToken(token string) bool {
-	a.RLock()
-	ok := subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) == 1
-	a.RUnlock()
-	return ok
+	return cookie.Value
 }

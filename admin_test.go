@@ -9,7 +9,7 @@ import (
 )
 
 func TestDealVoucher(t *testing.T) {
-	b := newBackend(t)
+	b := newBackend(t, nil)
 	t.Cleanup(b.Close)
 	rpcURL := "http://" + b.hs.Listener.Addr().String() + "/admin/json_rpc"
 
@@ -26,7 +26,7 @@ func TestDealVoucher(t *testing.T) {
 			header := http.Header{}
 			header.Set("Authorization", "Bearer "+test.token)
 			var ss Session
-			err := jsonrpc.Do(rpcURL, "deal_voucher", struct{}{}, &ss, header)
+			err := jsonrpc.Do(rpcURL, "dealProxyVoucher", struct{}{}, &ss, header)
 			if (err == nil) != test.ok {
 				t.Errorf("%+v", err)
 			}

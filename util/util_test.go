@@ -1,6 +1,7 @@
 package util
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -8,9 +9,10 @@ import (
 
 func TestParseEnv(t *testing.T) {
 	type secret struct {
-		Password          string
+		Password          Secret[string]
 		LineChannelSecret string
 		XMRWallet         string
+		Missing           Secret[string]
 		unexported        string
 	}
 	env := `
@@ -26,13 +28,29 @@ no equal sign
 	if err := ParseEnv(&s, strings.NewReader(env)); err != nil {
 		t.Fatalf("%+v", err)
 	}
-	expected := secret{
-		Password:          "p@ss=word",
-		LineChannelSecret: "secret",
-		XMRWallet:         "wallet",
+	if got := s.Password.Reveal(); got != "p@ss=word" {
+		t.Errorf("Password %q", got)
 	}
-	if s != expected {
-		t.Errorf("%+v", s)
+	if s.LineChannelSecret != "secret" {
+		t.Errorf("LineChannelSecret %q", s.LineChannelSecret)
+	}
+	if s.XMRWallet != "wallet" {
+		t.Errorf("XMRWallet %q", s.XMRWallet)
+	}
+	if got := s.Missing.Reveal(); got != "" {
+		t.Errorf("Missing %q", got)
+	}
+	if s.unexported != "" {
+		t.Errorf("unexported %q", s.unexported)
+	}
+	if str := fmt.Sprintf("%+v", s); strings.Contains(str, "p@ss") {
+		t.Errorf("leaked secret: %s", str)
+	}
+
+	// Unsupported field types are rejected.
+	var bad struct{ N int }
+	if err := ParseEnv(&bad, strings.NewReader("")); err == nil {
+		t.Errorf("expected error")
 	}
 }
 

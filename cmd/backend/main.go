@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io/fs"
 	"log"
 	"os"
@@ -149,7 +150,11 @@ type xmrWallet struct {
 }
 
 func (w xmrWallet) dir() string {
-	return filepath.Join(config.DevRoot, "monero_wallet", w.name)
+	cfg, err := config.Dev()
+	if err != nil {
+		panic(fmt.Sprintf("%+v", err))
+	}
+	return filepath.Join(cfg.Root, "monero_wallet", w.name)
 }
 
 func (w xmrWallet) file() string {

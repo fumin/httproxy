@@ -3,7 +3,9 @@ package util
 import (
 	"bufio"
 	"crypto/rand"
+	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -52,6 +54,8 @@ func ParseEnv(v any, r io.Reader) error {
 	}
 	sv := rv.Elem()
 
+	secretType := reflect.TypeFor[Secret[string]]()
+
 	// Map keys to fields.
 	fields := make(map[string]reflect.Value)
 	for i := range sv.NumField() {
@@ -59,8 +63,8 @@ func ParseEnv(v any, r io.Reader) error {
 		if !sf.IsExported() {
 			continue
 		}
-		if sf.Type.Kind() != reflect.String {
-			return errors.Errorf("field %s of type %s is not a string", sf.Name, sf.Type)
+		if sf.Type.Kind() != reflect.String && sf.Type != secretType {
+			return errors.Errorf("field %s of type %s is not a string or %s", sf.Name, sf.Type, secretType)
 		}
 		fields[sf.Name] = sv.Field(i)
 	}
@@ -80,7 +84,12 @@ func ParseEnv(v any, r io.Reader) error {
 		if !ok {
 			continue
 		}
-		f.SetString(strings.TrimSpace(val))
+		val = strings.TrimSpace(val)
+		if f.Type() == secretType {
+			f.Set(reflect.ValueOf(NewSecret(val)))
+		} else {
+			f.SetString(val)
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return errors.Wrap(err, "")
@@ -105,3 +114,28 @@ func ParentPid(pid int) (int, error) {
 	}
 	return 0, errors.Errorf("no PPid in %s", b)
 }
+
+// A Secret holds a value that prints as [REDACTED] through fmt, log/slog,
+// encoding/json, and reflection-based dumpers.
+type Secret[T any] struct {
+	// A closure rather than a field or pointer: reflection (fmt's fallback
+	// for unexported fields, spew, testify diffs) can't look inside a func.
+	get func() T
+}
+
+// NewSecret creates a secret.
+func NewSecret[T any](v T) Secret[T] { return Secret[T]{get: func() T { return v }} }
+
+// Reveal returns the underlying value, or T's zero value for a zero Secret.
+func (s Secret[T]) Reveal() T {
+	if s.get == nil {
+		var zero T
+		return zero
+	}
+	return s.get()
+}
+
+func (Secret[T]) Format(f fmt.State, _ rune)   { f.Write([]byte("[REDACTED]")) }
+func (Secret[T]) String() string               { return "[REDACTED]" }
+func (Secret[T]) LogValue() slog.Value         { return slog.StringValue("[REDACTED]") }
+func (Secret[T]) MarshalJSON() ([]byte, error) { return []byte(`"[REDACTED]"`), nil }

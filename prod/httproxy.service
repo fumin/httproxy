@@ -1,0 +1,25 @@
+# A user unit: install in ~/.config/systemd/user/ and manage with systemctl --user.
+#
+# This unit needs lingering, so that the user's systemd instance runs at boot:
+#   sudo loginctl enable-linger ubuntu
+# This is because gVisor runs sandboxes with systemd-run --user.
+
+[Unit]
+Description=httproxy
+Requires=monero-wallet-rpc.service
+After=monero-wallet-rpc.service
+
+[Service]
+Environment=GOPATH=%h/.local/go
+# NewServer queries the wallet at startup, so wait until its RPC answers.
+ExecStartPre=/bin/sh -c 'until curl -sf --max-time 30 http://127.0.0.1:28088/json_rpc -H "Content-Type: application/json" -d "{\"jsonrpc\":\"2.0\",\"id\":\"0\",\"method\":\"refresh\"}" >/dev/null; do sleep 1; done'
+TimeoutStartSec=120
+# systemd does not expand variables in the executable path, only in arguments,
+# so let env run it. env replaces itself with httproxy, so signals reach httproxy directly.
+ExecStart=/usr/bin/env ${GOPATH}/bin/httproxy -c=prod
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
